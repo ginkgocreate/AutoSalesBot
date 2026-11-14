@@ -1,0 +1,7 @@
+# 個人情報・認証情報を含むためコミットしない
+.env
+data/
+outbox/
+__pycache__/
+*.pyc
+.DS_Store
