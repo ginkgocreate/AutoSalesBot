@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from . import db
 from .config import Config, load_config
 from .crawler import Crawler, crawl_pending
-from .importer import import_csv
-from .mailer import TemplateError, load_template, render, send_batch
+from .discover import DEFAULT_OSM_KINDS, OSM_KINDS, DiscoverError, discover_osm, discover_search
+from .importer import import_csv, open_csv
+from .mailer import TemplateError, load_template, plan_count, render, send_batch
 from .replies import fetch_replies
 
 REVIEW_HEADERS = ["ID", "判定", "会社名", "アドレス", "注意", "掲載ページ", "層", "エリア", "業態"]
@@ -19,7 +22,23 @@ FLAG_LABELS = {
     "privacy": "個人情報窓口の可能性",
     "free_mail": "フリーメール",
     "offsite_domain": "サイトと別ドメイン（制作会社などの可能性）",
+    "label_glued": "見出しや電話番号とつながっていた（アドレスを要確認）",
+    "tag_joined": "アドレスの途中にタグがあった（アドレスを要確認）",
+    "contact_unread": "お問い合わせページを読めていない（お断りの表示を要確認）",
+    "page_truncated": "ページが長すぎて最後まで読めていない",
 }
+OK_WORDS = {"ok", "o", "○", "◯", "〇", "可", "yes", "y"}
+NG_WORDS = {"ng", "x", "×", "✕", "✗", "不可", "no", "n"}
+
+
+def _positive_int(value: str) -> int:
+    try:
+        n = int(unicodedata.normalize("NFKC", value))
+    except ValueError:
+        raise argparse.ArgumentTypeError("整数で指定してください")
+    if n < 1:
+        raise argparse.ArgumentTypeError("1以上で指定してください")
+    return n
 
 
 def _flags_ja(flags: str) -> str:
@@ -48,6 +67,24 @@ def cmd_import(cfg: Config, conn, args) -> int:
     c = import_csv(conn, path, source=args.source or "")
     print(f"追加 {c['added']}件 / 重複 {c['duplicate']}件 / 不備 {c['invalid']}件 / "
           f"ポータル・SNSのURLのため除外 {c['non_official']}件")
+    return 0
+
+
+def cmd_discover(cfg: Config, conn, args) -> int:
+    if not args.query.strip():
+        raise DiscoverError("地域名か、検索の言葉を指定してください")
+    before = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+    if args.source == "osm":
+        kinds = [k.strip() for k in (args.kinds or ",".join(DEFAULT_OSM_KINDS)).split(",") if k.strip()]
+        c = discover_osm(conn, args.query, kinds=kinds, segment=args.segment or "",
+                         user_agent=cfg.get("CRAWL_USER_AGENT"))
+    else:
+        print("Web検索で候補を探しています（数分かかります）…")
+        c = discover_search(conn, args.query, segment=args.segment or "", limit=args.limit or 20)
+    after = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+    print(f"追加 {c['added']}社 / すでにある {c['duplicate']}社 / 不備 {c['invalid']}件 / "
+          f"ポータル・SNSのURLのため除外 {c['non_official']}件（候補の合計 {before} → {after}社）")
+    print("次は crawl で、公式サイトから公表アドレスを集めてください。")
     return 0
 
 
@@ -88,9 +125,16 @@ def cmd_review(cfg: Config, conn, args) -> int:
     return 0
 
 
-def _decide(conn, contact_id: int, ok: bool) -> bool:
+def _decide(conn, contact_id: int, ok: bool, allow_bounced: bool = False) -> bool:
+    states = "('pending','approved','rejected','bounced')" if allow_bounced else "('pending','approved','rejected')"
+    if ok:
+        row = conn.execute(
+            "SELECT co.status FROM contacts ct JOIN companies co ON co.id=ct.company_id WHERE ct.id=?",
+            (contact_id,)).fetchone()
+        if row is None or row["status"] != "crawled":
+            return False  # 営業お断りなどで外した会社の連絡先は承認しない
     cur = conn.execute(
-        "UPDATE contacts SET status=?, decided_at=? WHERE id=? AND status IN ('pending','approved','rejected')",
+        f"UPDATE contacts SET status=?, decided_at=? WHERE id=? AND status IN {states}",
         ("approved" if ok else "rejected", db.now(), contact_id),
     )
     return cur.rowcount > 0
@@ -98,19 +142,30 @@ def _decide(conn, contact_id: int, ok: bool) -> bool:
 
 def cmd_approve(cfg: Config, conn, args) -> int:
     approved = rejected = 0
+    unreadable: list[int] = []
+    mismatched: list[int] = []
     if args.csv:
-        with open(args.csv, newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                verdict = (row.get("判定") or "").strip().lower()
-                cid = (row.get("ID") or "").strip()
-                if not cid.isdigit() or verdict not in ("ok", "ng", "○", "×", "o", "x"):
+        with open_csv(Path(args.csv)) as f:
+            for line_no, row in enumerate(csv.DictReader(f), start=2):
+                norm = {(k or "").strip(): unicodedata.normalize("NFKC", v if isinstance(v, str) else "").strip()
+                        for k, v in row.items()}
+                verdict = norm.get("判定", "").lower()
+                cid = norm.get("ID", "")
+                if not verdict:
                     continue
-                ok = verdict in ("ok", "○", "o")
+                if not (cid.isascii() and cid.isdigit()) or verdict not in OK_WORDS | NG_WORDS:
+                    unreadable.append(line_no)
+                    continue
+                known = conn.execute("SELECT email FROM contacts WHERE id=?", (int(cid),)).fetchone()
+                if known is None or (norm.get("アドレス") and norm["アドレス"].lower() != known["email"]):
+                    mismatched.append(line_no)  # 行がずれたCSVで、別の相手を承認しないため
+                    continue
+                ok = verdict in OK_WORDS
                 if _decide(conn, int(cid), ok):
                     approved += ok
                     rejected += not ok
     for cid in args.ids or []:
-        approved += _decide(conn, cid, True)
+        approved += _decide(conn, cid, True, allow_bounced=True)
     for cid in args.reject or []:
         rejected += _decide(conn, cid, False)
     if args.unflagged:
@@ -122,7 +177,13 @@ def cmd_approve(cfg: Config, conn, args) -> int:
         approved += cur.rowcount
     conn.commit()
     print(f"承認 {approved}件 / 見送り {rejected}件")
-    return 0
+    if unreadable:
+        print(f"読めなかった判定 {len(unreadable)}件（CSVの {', '.join(map(str, unreadable[:20]))} 行目）。"
+              "ok か ng で入れてください。")
+    if mismatched:
+        print(f"IDとアドレスが合わない行 {len(mismatched)}件（{', '.join(map(str, mismatched[:20]))} 行目）は"
+              "反映していません。review で出し直してください。")
+    return 1 if unreadable or mismatched else 0
 
 
 def cmd_preview(cfg: Config, conn, args) -> int:
@@ -144,17 +205,28 @@ def cmd_preview(cfg: Config, conn, args) -> int:
 def cmd_send(cfg: Config, conn, args) -> int:
     template = load_template(cfg.root / "templates" / f"{args.template}.txt")
     targets = db.sendable_contacts(conn, segment=args.segment)
+    n = 0
     if not targets:
         print("送れる相手がいません（承認済みで、まだ送っておらず、停止リストに無い連絡先が0件）。")
         return 0
+    if args.segment is None:
+        # 層ごとに文面が違う。1社1通で送り直せないので、混ざったままでは送らない
+        by_segment: dict[str, int] = {}
+        for row in targets:
+            by_segment[row["segment"]] = by_segment.get(row["segment"], 0) + 1
+        if len(by_segment) > 1:
+            listing = " / ".join(f"{seg or '層なし'} {n}社" for seg, n in sorted(by_segment.items()))
+            print(f"送れる相手に複数の層が混ざっています（{listing}）。"
+                  "--segment で層を指定してください（層なしだけに送るなら --segment \"\"）。")
+            return 1
     if args.live:
         missing = cfg.missing_sender_fields() + ([] if cfg.get("SMTP_HOST") else ["SMTP_HOST"])
         if missing:
             raise TemplateError("未設定の項目があります（.env）: " + ", ".join(missing))
         room = max(0, cfg.get_int("DAILY_LIMIT") - db.sent_today(conn))
-        n = min(x for x in (room, args.limit, len(targets)) if x is not None)
+        n = plan_count(conn, cfg, len(targets), args.limit, True)
         print(f"送れる相手 {len(targets)}社。今日の残り枠 {room}通。今回送るのは {n}通です。")
-        if n == 0:
+        if n <= 0:
             return 0
         if not args.yes:
             try:
@@ -164,9 +236,17 @@ def cmd_send(cfg: Config, conn, args) -> int:
             if answer != "yes":
                 print("中止しました。")
                 return 1
-    s = send_batch(conn, cfg, template, live=args.live, segment=args.segment, limit=args.limit)
+    # 本番では、確認で表示した通数を超えて送らない（入力待ちの間に承認が増えても同じ）
+    s = send_batch(conn, cfg, template, live=args.live, segment=args.segment,
+                   limit=n if args.live else args.limit)
     if args.live:
-        print(f"送信 {s.sent}通 / 失敗 {s.failed}通 / 上限のため次回へ {s.skipped_limit}社")
+        line = f"送信 {s.sent}通 / 失敗 {s.failed}通 / 上限のため次回へ {s.skipped_limit}社"
+        if s.unknown:
+            line += f" / 届いたか不明 {s.unknown}通"
+        print(line)
+        if s.stopped:
+            print(f"途中で止めました: {s.stopped}")
+            return 1
     else:
         print(f"下書き {s.dry_run}通を outbox/ に書き出しました（まだ送っていません）。"
               "中身を確かめてから --live を付けて実行してください。")
@@ -176,26 +256,54 @@ def cmd_send(cfg: Config, conn, args) -> int:
 def cmd_replies(cfg: Config, conn, args) -> int:
     c = fetch_replies(conn, cfg, days=args.days)
     print(f"確認 {c['checked']}通 → 返信 {c['reply']}件 / 停止の連絡 {c['optout']}件 / 不達 {c['bounce']}件")
+    if c["unreadable"]:
+        print(f"取得できなかったメール {c['unreadable']}通。もう一度 replies を実行してください。")
+        return 1
     return 0
 
 
 def cmd_suppress(cfg: Config, conn, args) -> int:
-    for target in args.targets:
-        new = db.add_suppression(conn, target, args.reason or "手動")
-        print(f"{target}: {'停止リストに入れました' if new else 'すでに停止リストにあります'}")
-    return 0
+    failed = 0
+    # 「a@x.jp, b@y.jp」のようにまとめて貼られたものは、1件ずつに分ける
+    targets = [t for raw in args.targets for t in re.split(r"[,;、\s]+", raw) if t]
+    for target in targets:
+        try:
+            new = db.add_suppression(conn, target, args.reason or "手動")
+        except ValueError:
+            print(f"{target}: アドレスかドメインとして読めません（停止リストに入れていません）")
+            failed += 1
+            continue
+        shown = db.normalize_target(target)
+        print(f"{shown}: {'停止リストに入れました' if new else 'すでに停止リストにあります'}")
+    return 1 if failed else 0
 
 
 def cmd_unrefuse(cfg: Config, conn, args) -> int:
-    row = conn.execute("SELECT name, status, status_note FROM companies WHERE id=?", (args.company_id,)).fetchone()
+    row = conn.execute("SELECT name, status, refusal_confirmed, crawled_at FROM companies WHERE id=?",
+                       (args.company_id,)).fetchone()
     if not row or row["status"] != "refused":
         print("「営業お断り」で除外中の会社ではありません。")
         return 1
-    print(f"{row['name']}: {row['status_note']}")
-    conn.execute("UPDATE companies SET status='new', refusal_checked=1, "
-                 "status_note='人が確認して除外を解除' WHERE id=?", (args.company_id,))
+    found = conn.execute(
+        "SELECT url, detail FROM crawl_log WHERE company_id=? AND result='refusal' AND fetched_at=? ORDER BY id",
+        (args.company_id, row["crawled_at"])).fetchall()
+    print(f"{row['name']} で見つけた表示（{len(found)}件）:")
+    for i, r in enumerate(found, 1):
+        print(f"  {i}. {r['detail']}\n     {r['url']}")
+    if not args.yes:
+        try:
+            answer = input("上の表示はすべて「営業メールお断り」ではない、でよいですか？ (yes と入力): ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer != "yes":
+            print("そのままにしました。")
+            return 1
+    confirmed = {line for line in row["refusal_confirmed"].split("\n") if line} | {r["detail"] for r in found}
+    conn.execute("UPDATE companies SET status='new', refusal_confirmed=?, status_note='人が確認して除外を解除' "
+                 "WHERE id=?", ("\n".join(sorted(confirmed)), args.company_id))
     conn.commit()
-    print("除外を解除しました。crawl を実行すると、この会社のアドレスが確認待ちに入ります。")
+    print("除外を解除しました。crawl を実行すると、この会社のアドレスが確認待ちに入ります。"
+          "次の巡回で別の表示が見つかった場合は、また除外されます。")
     return 0
 
 
@@ -213,24 +321,25 @@ def cmd_stats(cfg: Config, conn, args) -> int:
         if n:
             print(f"  {label} {n}社")
     print("■ 連絡先")
-    for key, label in [("pending", "確認待ち"), ("approved", "承認済み"), ("rejected", "見送り"), ("bounced", "不達")]:
+    for key, label in [("pending", "確認待ち"), ("approved", "承認済み"), ("rejected", "見送り"), ("bounced", "宛先不明")]:
         print(f"  {label} {one('SELECT COUNT(*) FROM contacts WHERE status=?', key)}件")
-    print("■ 送信と反応（層ごと）")
-    rows = conn.execute(
-        "SELECT co.segment AS seg, "
-        " COUNT(DISTINCT CASE WHEN s.status='sent' THEN ct.id END) AS sent "
-        "FROM companies co JOIN contacts ct ON ct.company_id=co.id "
-        "LEFT JOIN sends s ON s.contact_id=ct.id GROUP BY co.segment ORDER BY co.segment"
-    ).fetchall()
-    for r in rows:
-        seg = r["seg"]
-        base = ("FROM replies rp JOIN contacts ct ON ct.id=rp.contact_id "
-                "JOIN companies co ON co.id=ct.company_id WHERE co.segment=? ")
-        reply = one("SELECT COUNT(*) " + base + "AND rp.kind='reply'", seg)
-        optout = one("SELECT COUNT(*) " + base + "AND rp.kind='optout'", seg)
-        bounce = one("SELECT COUNT(*) " + base + "AND rp.kind='bounce'", seg)
-        choices = [one("SELECT COUNT(*) " + base + "AND rp.choice=?", seg, i) for i in (1, 2, 3, 4)]
-        print(f"  [{seg or '層なし'}] 送信 {r['sent']}通 / 返信 {reply}件 / 停止 {optout}件 / 不達 {bounce}件"
+    print("■ 送信と反応（層ごと、会社の数）")
+    segments = [r[0] for r in conn.execute("SELECT DISTINCT segment FROM companies ORDER BY segment")]
+    latest = ("(SELECT MAX(r2.id) FROM replies r2 JOIN contacts c2 ON c2.id=r2.contact_id "
+              "WHERE r2.kind='reply' AND r2.choice IS NOT NULL GROUP BY c2.company_id)")
+    base = ("FROM replies rp JOIN contacts ct ON ct.id=rp.contact_id "
+            "JOIN companies co ON co.id=ct.company_id WHERE co.segment=? ")
+    for seg in segments:
+        sent = one("SELECT COUNT(DISTINCT co.id) FROM sends s JOIN contacts ct ON ct.id=s.contact_id "
+                   "JOIN companies co ON co.id=ct.company_id WHERE co.segment=? AND s.status IN ('sent','unknown')", seg)
+        if not sent:
+            continue
+        reply = one("SELECT COUNT(DISTINCT co.id) " + base + "AND rp.kind='reply'", seg)
+        optout = one("SELECT COUNT(DISTINCT co.id) " + base + "AND rp.kind='optout'", seg)
+        bounce = one("SELECT COUNT(DISTINCT co.id) " + base + "AND rp.kind='bounce'", seg)
+        choices = [one("SELECT COUNT(*) " + base + f"AND rp.choice=? AND rp.id IN {latest}", seg, i)
+                   for i in (1, 2, 3, 4)]
+        print(f"  [{seg or '層なし'}] 送信 {sent}社 / 返信 {reply}社 / 停止 {optout}社 / 不達 {bounce}社"
               f" / 番号 1:{choices[0]} 2:{choices[1]} 3:{choices[2]} 4:{choices[3]}")
     print(f"■ 停止リスト {one('SELECT COUNT(*) FROM suppressions')}件 / 今日の送信 {db.sent_today(conn)}通"
           f"（上限 {cfg.get('DAILY_LIMIT')}通）")
@@ -271,8 +380,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--source", help="リストの出どころのメモ")
     s.set_defaults(func=cmd_import)
 
+    s = sub.add_parser("discover", help="候補（公式サイトのURL）を自動で集める")
+    s.add_argument("source", choices=["osm", "search"],
+                   help="osm = 地図のオープンデータから / search = Web検索で運営会社を探す")
+    s.add_argument("query", help="osm: 地域名（例: 奈良県、大阪市） / search: 検索の言葉")
+    s.add_argument("--kinds", help="osm の種類をカンマ区切りで（" + ", ".join(OSM_KINDS) + "）")
+    s.add_argument("--segment", help="集めた候補に付ける層（例: honbu / show）")
+    s.add_argument("--limit", type=_positive_int, help="search で集める最大件数（既定 20）")
+    s.set_defaults(func=cmd_discover)
+
     s = sub.add_parser("crawl", help="公式サイトを見て、公表アドレスを集める")
-    s.add_argument("--limit", type=int)
+    s.add_argument("--limit", type=_positive_int)
     s.add_argument("--recrawl", action="store_true", help="アドレスなし・エラーだった会社も見直す")
     s.set_defaults(func=cmd_crawl)
 
@@ -295,13 +413,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("send", help="承認済みの相手に送る（--live が無ければ下書きを書くだけ）")
     s.add_argument("--template", default="honbu")
     s.add_argument("--segment", help="この層だけに送る（例: honbu / show）")
-    s.add_argument("--limit", type=int)
+    s.add_argument("--limit", type=_positive_int)
     s.add_argument("--live", action="store_true", help="実際に送信する")
     s.add_argument("--yes", action="store_true", help="確認の入力を省く")
     s.set_defaults(func=cmd_send)
 
     s = sub.add_parser("replies", help="返信を取り込む（不要→停止、番号→集計、不達→除外）")
-    s.add_argument("--days", type=int, default=14)
+    s.add_argument("--days", type=_positive_int, default=14)
     s.set_defaults(func=cmd_replies)
 
     s = sub.add_parser("suppress", help="アドレスかドメインを停止リストに入れる")
@@ -311,6 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("unrefuse", help="「営業お断り」の誤検知を、人が確認して解除する")
     s.add_argument("company_id", type=int)
+    s.add_argument("--yes", action="store_true", help="確認の入力を省く")
     s.set_defaults(func=cmd_unrefuse)
 
     sub.add_parser("stats", help="件数と反応を見る").set_defaults(func=cmd_stats)
@@ -321,14 +440,24 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _run(cfg: Config, conn, args) -> int:
+    try:
+        return args.func(cfg, conn, args)
+    except (TemplateError, DiscoverError, ValueError, OSError) as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+
+
+def main_for_test(cfg: Config, conn, argv: list[str]) -> int:
+    """テスト用の入口。設定とDBを外から渡す。"""
+    return _run(cfg, conn, build_parser().parse_args(argv))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = load_config()
     conn = db.connect(cfg.path("DB_PATH"))
     try:
-        return args.func(cfg, conn, args)
-    except TemplateError as e:
-        print(f"エラー: {e}", file=sys.stderr)
-        return 1
+        return _run(cfg, conn, args)
     finally:
         conn.close()

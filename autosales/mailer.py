@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import re
 import smtplib
 import sqlite3
@@ -135,6 +136,52 @@ class SendSummary:
     failed: int = 0
     dry_run: int = 0
     skipped_limit: int = 0
+    unknown: int = 0
+    stopped: str = ""  # 途中で止めた理由
+
+
+# 宛先そのものが存在しないときだけ「不達」にする。中継拒否や認証の失敗は設定の問題なので連絡先は触らない
+_NO_SUCH_USER_RE = re.compile(
+    r"5\.1\.(?:1|2|3|6|10)\b|user unknown|unknown user|no such user|does not exist|doesn't exist|"
+    r"unknown recipient|recipient unknown|unknown address|address unknown|mailbox not found|"
+    r"mailbox unavailable|invalid recipient|recipient address rejected: user|account.{0,20}disabled",
+    re.I,
+)
+
+
+def _is_no_such_user(code: int, text: str) -> bool:
+    if not 500 <= code < 600:
+        return False
+    if re.search(r"sender|relay|spf|dkim|auth|blocked|blacklist|blocklist|policy|spam", text, re.I):
+        return False  # 送る側の問題。宛先は悪くない
+    if re.search(r"5\.(?:7|5|3|4|2)\.\d+", text) and not re.search(r"5\.1\.\d+", text):
+        return False  # 5.7.x（拒否・中継不可）などは宛先不明ではない
+    return _NO_SUCH_USER_RE.search(text) is not None
+
+
+@contextlib.contextmanager
+def _send_lock(cfg: Config):
+    """送信の同時実行を防ぐ。2本同時に動くと、同じ会社に2通届いたり上限を超えたりする。"""
+    path = cfg.root / "data" / "send.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "w")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            pass  # Windows など。1本ずつ動かしてください
+        except OSError:
+            raise TemplateError("別の送信（send --live）が実行中です。終わってからやり直してください")
+        yield
+    finally:
+        handle.close()
+
+
+def plan_count(conn: sqlite3.Connection, cfg: Config, targets: int, limit: int | None, live: bool) -> int:
+    """今回送る数。本番では、今日の残り枠を絶対に超えない。"""
+    room = max(0, cfg.get_int("DAILY_LIMIT") - db.sent_today(conn)) if live else None
+    return max(0, min(x for x in (room, limit, targets) if x is not None))
 
 
 def send_batch(
@@ -154,87 +201,160 @@ def send_batch(
         raise TemplateError("送信者の表示が未設定です（.env）: " + ", ".join(missing))
     if live and not cfg.get("SMTP_HOST"):
         raise TemplateError("SMTP_HOST が未設定です（.env）")
+    if limit is not None and limit < 1:
+        raise TemplateError("--limit は1以上で指定してください")
+    if not live:
+        return _write_drafts(conn, cfg, template, segment, limit, log)
+    with _send_lock(cfg):
+        return _send_live(conn, cfg, template, segment, limit, log, sleep)
 
-    summary = SendSummary()
+
+def _prepare(conn: sqlite3.Connection, cfg: Config, template: Template, segment: str | None,
+             limit: int | None, live: bool, summary: SendSummary) -> list[tuple[sqlite3.Row, str, str]]:
     targets = db.sendable_contacts(conn, segment=segment)
     summary.planned = len(targets)
-
-    room = None
-    if live:
-        room = max(0, cfg.get_int("DAILY_LIMIT") - db.sent_today(conn))
-    cap = min(x for x in (room, limit, len(targets)) if x is not None)
+    cap = plan_count(conn, cfg, len(targets), limit, live)
     summary.skipped_limit = len(targets) - cap
-    targets = targets[:cap]
-    if not targets:
-        return summary
-
     # 先に全員分を組み立てる。差し込みの不備があれば1通も送らずに止まる
-    prepared = []
-    for row in targets:
-        subject, body = render(template, cfg, row)
-        prepared.append((row, subject, body))
+    return [(row, *render(template, cfg, row)) for row in targets[:cap]]
 
-    if not live:
-        outdir = cfg.root / "outbox" / db.now()[:10]
-        outdir.mkdir(parents=True, exist_ok=True)
+
+def _write_drafts(conn: sqlite3.Connection, cfg: Config, template: Template, segment: str | None,
+                  limit: int | None, log: Callable[[str], None]) -> SendSummary:
+    summary = SendSummary()
+    prepared = _prepare(conn, cfg, template, segment, limit, False, summary)
+    if not prepared:
+        return summary
+    outdir = cfg.root / "outbox" / db.now()[:10]
+    outdir.mkdir(parents=True, exist_ok=True)
+    for row, subject, body in prepared:
+        msg = build_message(cfg, row["email"], subject, body)
+        path = outdir / f"{row['contact_id']:05d}_{_safe_name(row['email'])}.eml"
+        path.write_bytes(bytes(msg))
+        conn.execute(
+            "INSERT INTO sends(contact_id, template, subject, message_id, status, sent_at)"
+            " VALUES (?,?,?,?, 'dry_run', ?)",
+            (row["contact_id"], template.name, subject, msg["Message-ID"], db.now()),
+        )
+        summary.dry_run += 1
+        log(f"[下書き] {row['name']} <{row['email']}> → {path.relative_to(cfg.root)}")
+    conn.commit()
+    return summary
+
+
+def _send_live(conn: sqlite3.Connection, cfg: Config, template: Template, segment: str | None,
+               limit: int | None, log: Callable[[str], None], sleep: Callable[[float], None]) -> SendSummary:
+    summary = SendSummary()
+    prepared = _prepare(conn, cfg, template, segment, limit, True, summary)
+    if not prepared:
+        return summary
+    interval = max(0.0, cfg.get_float("SEND_INTERVAL_SEC"))
+    daily_limit = cfg.get_int("DAILY_LIMIT")
+    smtp: smtplib.SMTP | None = None
+    refused_streak: list[int] = []  # 続けて断られた連絡先（宛先不明にしたもの）
+
+    def finish(send_id: int, status: str, error: str = "") -> None:
+        conn.execute("UPDATE sends SET status=?, error=?, sent_at=? WHERE id=?", (status, error, db.now(), send_id))
+        conn.commit()
+
+    try:
+        first = True
         for row, subject, body in prepared:
+            if not first:
+                sleep(interval)
+            # 待ったあと、送る直前に、宛先を決めるのと同じ決まりでもう一度確かめる
+            # （待っている間に停止の連絡・見送り・お断りの検知・別の送信が入ることがある）
+            if db.sent_today(conn) >= daily_limit:
+                summary.stopped = "今日の上限に達しました"
+                break
+            still_ok = {r["contact_id"] for r in db.sendable_contacts(conn, segment=segment)}
+            if row["contact_id"] not in still_ok:
+                log(f"[見送り] {row['name']} <{row['email']}>（停止・見送り・送信済みのいずれか）")
+                continue
+            first = False
+
+            # 待っている間に回線が切れていたら、つなぎ直す（まだ何も送っていないので安全）
+            try:
+                if smtp is None or smtp.noop()[0] != 250:
+                    raise smtplib.SMTPServerDisconnected("reconnect")
+            except (smtplib.SMTPException, OSError):
+                with contextlib.suppress(Exception):
+                    if smtp is not None:
+                        smtp.close()
+                try:
+                    smtp = _connect_smtp(cfg)
+                except (smtplib.SMTPException, OSError) as e:
+                    summary.stopped = f"メールサーバーにつながりません: {type(e).__name__}: {e}"
+                    break
+
             msg = build_message(cfg, row["email"], subject, body)
-            path = outdir / f"{row['contact_id']:05d}_{_safe_name(row['email'])}.eml"
-            path.write_bytes(bytes(msg))
-            conn.execute(
-                "INSERT INTO sends(contact_id, template, subject, message_id, status, sent_at)"
-                " VALUES (?,?,?,?, 'dry_run', ?)",
+            # 送る前に「届いたか不明」として書いておく。途中で止められても（Ctrl-C など）再送しないため
+            cur = conn.execute(
+                "INSERT INTO sends(contact_id, template, subject, message_id, status, error, sent_at)"
+                " VALUES (?,?,?,?, 'unknown', '送信中に中断', ?)",
                 (row["contact_id"], template.name, subject, msg["Message-ID"], db.now()),
             )
-            summary.dry_run += 1
-            log(f"[下書き] {row['name']} <{row['email']}> → {path.relative_to(cfg.root)}")
-        conn.commit()
-        return summary
-
-    interval = max(0.0, cfg.get_float("SEND_INTERVAL_SEC"))
-    smtp = _connect_smtp(cfg)
-    try:
-        for i, (row, subject, body) in enumerate(prepared):
-            # 送る直前にもう一度確かめる（待っている間に停止の連絡が入ることがある）
-            if db.is_suppressed(conn, row["email"]):
-                log(f"[停止済み] {row['name']} <{row['email']}>")
-                continue
-            if i:
-                sleep(interval)
-            msg = build_message(cfg, row["email"], subject, body)
-            status, error = "sent", ""
+            conn.commit()
+            send_id = cur.lastrowid
             try:
                 refused = smtp.send_message(msg, from_addr=cfg.get("SENDER_EMAIL"), to_addrs=[row["email"]])
-                if refused:
-                    status, error = "failed", str(refused)
             except smtplib.SMTPRecipientsRefused as e:
-                status, error = "failed", str(e.recipients)
-                codes = [code for code, _ in e.recipients.values()]
-                if codes and all(500 <= code < 600 for code in codes):
-                    # 宛先が存在しないなどの恒久的な拒否。次回以降は送らない
+                code, raw = next(iter(e.recipients.values()), (0, b""))
+                text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                finish(send_id, "failed", f"{code} {text}")
+                summary.failed += 1
+                log(f"[失敗] {row['name']} <{row['email']}> {code} {text}")
+                if not 500 <= code < 600:
+                    continue  # 一時的な拒否。次回もう一度試す
+                earlier = conn.execute(
+                    "SELECT COUNT(*) FROM sends WHERE contact_id=? AND status='failed' AND error LIKE '5%'",
+                    (row["contact_id"],)).fetchone()[0]
+                if _is_no_such_user(code, text) or earlier >= 2:
+                    # 宛先が存在しない（または別の日にも断られた）。次回以降は送らない
                     conn.execute("UPDATE contacts SET status='bounced', decided_at=? WHERE id=?",
                                  (db.now(), row["contact_id"]))
-            except smtplib.SMTPServerDisconnected as e:
-                status, error = "failed", f"接続が切れました: {e}"
-            except smtplib.SMTPException as e:
-                status, error = "failed", f"{type(e).__name__}: {e}"
-            conn.execute(
-                "INSERT INTO sends(contact_id, template, subject, message_id, status, error, sent_at)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (row["contact_id"], template.name, subject, msg["Message-ID"], status, error, db.now()),
-            )
-            conn.commit()
-            if status == "sent":
-                summary.sent += 1
-                log(f"[送信] {row['name']} <{row['email']}>")
-            else:
-                summary.failed += 1
-                log(f"[失敗] {row['name']} <{row['email']}> {error}")
-                if "接続が切れました" in error:
+                    conn.commit()
+                refused_streak.append(row["contact_id"])
+                if len(refused_streak) >= 2:
+                    # 続けて2社に断られたら、相手ではなくこちらの設定の問題を疑う。宛先不明の印は取り消す
+                    marks = ",".join("?" * len(refused_streak))
+                    conn.execute(f"UPDATE contacts SET status='approved' WHERE status='bounced' AND id IN ({marks})",
+                                 refused_streak)
+                    conn.commit()
+                    summary.stopped = "続けて断られました。SMTP の設定（送信元アドレスなど）を確認してください"
                     break
+                continue
+            except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError, smtplib.SMTPHeloError,
+                    smtplib.SMTPNotSupportedError) as e:
+                finish(send_id, "failed", f"{type(e).__name__}: {e}")
+                summary.failed += 1
+                summary.stopped = f"サーバーが送信を受け付けません: {e}"
+                log(f"[失敗] {row['name']} <{row['email']}> {e}")
+                break
+            except (smtplib.SMTPServerDisconnected, OSError) as e:
+                # 送っている途中で切れた。相手に届いたかどうか分からないので「送った扱い」にして再送しない
+                finish(send_id, "unknown", f"{type(e).__name__}: {e}")
+                summary.unknown += 1
+                summary.stopped = "送信の途中で回線が切れました（届いたか不明の1通は、送った扱いにして再送しません）"
+                log(f"[不明] {row['name']} <{row['email']}> 回線が切れました")
+                smtp = None
+                break
+            except smtplib.SMTPException as e:
+                finish(send_id, "failed", f"{type(e).__name__}: {e}")
+                summary.failed += 1
+                summary.stopped = f"送信に失敗しました: {e}"
+                log(f"[失敗] {row['name']} <{row['email']}> {e}")
+                break
+            if refused:
+                finish(send_id, "failed", str(refused))
+                summary.failed += 1
+                continue
+            finish(send_id, "sent")
+            refused_streak.clear()
+            summary.sent += 1
+            log(f"[送信] {row['name']} <{row['email']}>")
     finally:
-        try:
-            smtp.quit()
-        except Exception:
-            pass
+        if smtp is not None:
+            with contextlib.suppress(Exception):
+                smtp.quit()
     return summary

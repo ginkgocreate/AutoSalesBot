@@ -29,7 +29,7 @@ DEFAULTS = {
     "IMAP_FOLDER": "INBOX",
     "CRAWL_USER_AGENT": "AutoSalesBot/0.1",
     "CRAWL_DELAY_SEC": "2",
-    "CRAWL_MAX_PAGES": "6",
+    "CRAWL_MAX_PAGES": "8",
     "DB_PATH": "data/autosales.db",
 }
 
