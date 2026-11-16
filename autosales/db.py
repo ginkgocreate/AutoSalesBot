@@ -1,4 +1,5 @@
 """SQLite の入れ物。送ってよい相手かどうかの判定もここに一本化する。"""
+
 from __future__ import annotations
 
 import re
@@ -7,6 +8,8 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from .migrations import upgrade
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS companies (
@@ -98,16 +101,19 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(SCHEMA)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(companies)")}
-    if "refusal_confirmed" not in cols:
-        conn.execute("ALTER TABLE companies ADD COLUMN refusal_confirmed TEXT NOT NULL DEFAULT ''")
-    conn.commit()
+    try:
+        upgrade(conn, SCHEMA)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
 # 「送った」とみなす状態。unknown は、サーバーの返事が来る前に回線が切れたもの（届いた可能性がある）
 CONTACTED = ("sent", "unknown")
+# フォームでは、人がブラウザで送ったもの（manual）も「送った」に数える
+FORM_CONTACTED = ("sent", "unknown", "manual")
+_FORM_DONE = "fs.status IN ('sent','unknown','manual')"
 _EMAIL_RE = re.compile(r"[a-z0-9][a-z0-9._%+\-]*@[a-z0-9\-]+(?:\.[a-z0-9\-]+)+")
 _DOMAIN_RE = re.compile(r"[a-z0-9\-]+(?:\.[a-z0-9\-]+)+")
 # 会社ごと止める理由ではないもの（そのアドレスだけを止める）
@@ -172,13 +178,15 @@ def suppression_reason(conn: sqlite3.Connection, email: str) -> str | None:
     marks = ",".join("?" * len(cands))
     row = conn.execute(
         f"SELECT reason FROM suppressions WHERE target IN ({marks}) "
-        "ORDER BY (reason LIKE '不達%' OR reason LIKE 'refused_site:%'), id LIMIT 1", cands
+        "ORDER BY (reason LIKE '不達%' OR reason LIKE 'refused_site:%'), id LIMIT 1",
+        cands,
     ).fetchone()
     if row is not None:
         return row[0]
     row = conn.execute(
         "SELECT se.company_id FROM site_emails se JOIN companies co ON co.id = se.company_id "
-        "WHERE se.email = ? AND co.status = 'refused' LIMIT 1", (cands[0],)
+        "WHERE se.email = ? AND co.status = 'refused' LIMIT 1",
+        (cands[0],),
     ).fetchone()
     return None if row is None else f"refused_site:{row[0]}"
 
@@ -202,7 +210,8 @@ def blocked_companies(conn: sqlite3.Connection) -> set[int]:
             blocked.add(r[0])
     # 担当者個人のアドレスで停止を受けた場合も、その人の会社（同じドメインのサイト）ごと止める
     stop_domains = {
-        email_domain(t[0]) for t in conn.execute("SELECT target, reason FROM suppressions")
+        email_domain(t[0])
+        for t in conn.execute("SELECT target, reason FROM suppressions")
         if "@" in t[0] and _is_company_level(t[1])
     }
     if stop_domains:
@@ -217,17 +226,44 @@ def is_suppressed(conn: sqlite3.Connection, email: str) -> bool:
 
 
 def company_contacted(conn: sqlite3.Connection, company_id: int) -> bool:
+    """その会社に、メールかフォームのどちらかで、もう連絡したか。"""
     row = conn.execute(
         "SELECT 1 FROM sends s JOIN contacts c ON c.id = s.contact_id "
-        "WHERE c.company_id = ? AND s.status IN ('sent','unknown') LIMIT 1", (company_id,)
+        "WHERE c.company_id = ? AND s.status IN ('sent','unknown') "
+        f"UNION ALL SELECT 1 FROM form_sends fs WHERE fs.company_id = ? AND {_FORM_DONE} LIMIT 1",
+        (company_id, company_id),
     ).fetchone()
     return row is not None
 
 
+def _shared_contacted_companies(conn: sqlite3.Connection) -> set[int]:
+    """Exclude companies sharing a published address with an already reached company."""
+    return {
+        row[0]
+        for row in conn.execute(f"""
+        WITH published AS (
+            SELECT company_id, email FROM site_emails
+            UNION SELECT company_id, email FROM contacts
+        ), contacted AS (
+            SELECT ct.company_id FROM sends s JOIN contacts ct ON ct.id=s.contact_id
+            WHERE s.status IN ('sent','unknown')
+            UNION SELECT fs.company_id FROM form_sends fs WHERE {_FORM_DONE}
+        )
+        SELECT DISTINCT candidate.company_id
+        FROM published candidate
+        JOIN published reached ON reached.email=candidate.email
+        JOIN contacted ON contacted.company_id=reached.company_id
+    """)
+    }
+
+
 def sent_today(conn: sqlite3.Connection) -> int:
+    """今日送った数。メールとフォームを合わせて数える（1日の上限は共通）。"""
     today = datetime.now().astimezone().date().isoformat()
     row = conn.execute(
-        "SELECT COUNT(*) FROM sends WHERE status IN ('sent','unknown') AND substr(sent_at,1,10)=?", (today,)
+        "SELECT (SELECT COUNT(*) FROM sends WHERE status IN ('sent','unknown') AND substr(sent_at,1,10)=?)"
+        f" + (SELECT COUNT(*) FROM form_sends fs WHERE {_FORM_DONE} AND substr(fs.sent_at,1,10)=?)",
+        (today, today),
     ).fetchone()
     return int(row[0])
 
@@ -240,7 +276,7 @@ def sendable_contacts(conn: sqlite3.Connection, segment: str | None = None) -> l
       - 会社が「営業お断り」などで除外されていない（status='crawled'）
       - 停止リストに無い（アドレス・ドメイン・親ドメイン）
       - その会社の誰かから停止の連絡を受けていない（別のアドレスに繰り上げて送らない）
-      - その会社にまだ1通も送っていない（1社1通、追い送りなし）
+      - その会社にまだ1通も送っていない（1社1通、追い送りなし。フォームで連絡した会社も含む）
     1社に承認済みが複数あるときは、注意フラグの少ないものを1件だけ選ぶ。
     """
     sql = """
@@ -252,6 +288,8 @@ def sendable_contacts(conn: sqlite3.Connection, segment: str | None = None) -> l
           AND NOT EXISTS (
               SELECT 1 FROM sends s JOIN contacts c2 ON c2.id = s.contact_id
               WHERE c2.company_id = co.id AND s.status IN ('sent','unknown'))
+          AND NOT EXISTS (
+              SELECT 1 FROM form_sends fs WHERE fs.company_id = co.id AND fs.status IN ('sent','unknown','manual'))
     """
     params: list[str] = []
     if segment is not None:
@@ -259,7 +297,7 @@ def sendable_contacts(conn: sqlite3.Connection, segment: str | None = None) -> l
         params.append(segment)
     sql += " ORDER BY co.id, (ct.flags != ''), ct.id"
     rows = conn.execute(sql, params).fetchall()
-    blocked = blocked_companies(conn)
+    blocked = blocked_companies(conn) | _shared_contacted_companies(conn)
     picked: list[sqlite3.Row] = []
     seen_companies: set[int] = set()
     for row in rows:
@@ -270,3 +308,55 @@ def sendable_contacts(conn: sqlite3.Connection, segment: str | None = None) -> l
         seen_companies.add(row["company_id"])
         picked.append(row)
     return picked
+
+
+def sendable_forms(conn: sqlite3.Connection, segment: str | None = None, mode: str = "auto") -> list[sqlite3.Row]:
+    """いまフォームで連絡してよい会社だけを返す。フォーム送信はこの関数以外から相手を取らないこと。
+
+    条件:
+      - auto は人が承認したフォームだけ。manual は、人が「送らない」と決めていないもの
+        （manual は送るときに人が1件ずつ見て決める）
+      - 会社が「営業お断り」などで除外されていない
+      - メールで送れる相手がいない（確認待ち・承認済みのアドレスがある会社は、メールを優先する）
+      - 停止リストに無い（会社のドメイン、サイトに載っていたアドレス）
+      - その会社にまだ連絡していない（メールでもフォームでも。1社1回）
+      - サイトに載っているアドレスが、別の会社の連絡先として送信済み・送信待ちではない（同じ窓口に2回届けない）
+    """
+    status = "f.status = 'approved'" if mode == "auto" else "f.status IN ('pending','approved')"
+    sql = f"""
+        SELECT f.id AS form_id, f.page_url, f.mode, f.kind, f.reason, f.flags, f.signature, f.plan, f.demoted,
+               co.id AS company_id, co.name, co.host, co.site_url, co.segment, co.area, co.category,
+               co.refusal_confirmed
+        FROM forms f JOIN companies co ON co.id = f.company_id
+        WHERE f.mode = ? AND {status}
+          AND co.status IN ('crawled','no_email')
+          AND NOT EXISTS (SELECT 1 FROM contacts ct WHERE ct.company_id = co.id
+                          AND ct.status IN ('pending','approved'))
+          AND NOT EXISTS (
+              SELECT 1 FROM sends s JOIN contacts c2 ON c2.id = s.contact_id
+              WHERE c2.company_id = co.id AND s.status IN ('sent','unknown'))
+          AND NOT EXISTS (
+              SELECT 1 FROM form_sends fs WHERE fs.company_id = co.id AND {_FORM_DONE})
+    """
+    params: list[str] = [mode]
+    if segment is not None:
+        sql += " AND co.segment = ?"
+        params.append(segment)
+    sql += " ORDER BY co.id"
+    blocked = blocked_companies(conn) | _shared_contacted_companies(conn)
+    # サイトに載っているアドレスが、別の会社の連絡先として送信済み・送信待ちなら、同じ窓口なのでフォームでは送らない
+    shared = {
+        r[0]
+        for r in conn.execute(
+            "SELECT se.company_id FROM site_emails se JOIN contacts ct ON ct.email = se.email "
+            "WHERE ct.company_id != se.company_id AND (ct.status IN ('pending','approved') OR EXISTS ("
+            "SELECT 1 FROM sends s WHERE s.contact_id = ct.id AND s.status IN ('sent','unknown')))"
+        )
+    }
+    return [
+        row
+        for row in conn.execute(sql, params).fetchall()
+        if row["company_id"] not in blocked
+        and row["company_id"] not in shared
+        and not is_suppressed(conn, "x@" + row["host"])
+    ]

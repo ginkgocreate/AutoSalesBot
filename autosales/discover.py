@@ -8,6 +8,7 @@
   search … Claude Code（claude コマンド）にWeb検索をさせて、運営会社の公式サイトを探す。
            この端末に Claude Code が入っていて、ログイン済みであること。
 """
+
 from __future__ import annotations
 
 import json
@@ -94,7 +95,9 @@ def discover_osm(
         raise DiscoverError("OpenStreetMap の応答を読めませんでした")
     if data.get("remark"):
         # 時間切れやメモリ超過のとき、途中までの結果に remark を付けて返してくる
-        raise DiscoverError(f"OpenStreetMap が途中で打ち切りました（地域か種類を絞ってください）: {str(data['remark'])[:200]}")
+        raise DiscoverError(
+            f"OpenStreetMap が途中で打ち切りました（地域か種類を絞ってください）: {str(data['remark'])[:200]}"
+        )
     elements = [el for el in (data.get("elements") or []) if isinstance(el, dict)]
     if not elements:
         log("該当なし。地域名は地図上の正式な名前（例: 大阪市、奈良県）で指定してください。")
@@ -114,8 +117,19 @@ def discover_osm(
             parts = urlsplit(url)
         except ValueError:
             continue
-        g = groups.setdefault(host, {"shops": [], "names": set(), "operators": set(), "brands": set(),
-                                     "cities": set(), "cats": set(), "ids": set(), "top": None})
+        g = groups.setdefault(
+            host,
+            {
+                "shops": [],
+                "names": set(),
+                "operators": set(),
+                "brands": set(),
+                "cities": set(),
+                "cats": set(),
+                "ids": set(),
+                "top": None,
+            },
+        )
         key = (el.get("type"), el.get("id"))
         if key in g["ids"] and key != (None, None):
             continue
@@ -145,17 +159,33 @@ def discover_osm(
             # 1店だけ、または同じホストに無関係な店が相乗りしている（ホームページ作成サービスなど）。
             # 後者は1社にまとめず、最初の店だけを登録どおりのURLで入れる
             others = "、".join(n for n, _ in shops[1:8])
-            add_company(conn, counts, name=shops[0][0], url=shops[0][1], area=cities, category=category,
-                        stores=1, segment=segment,
-                        notes=f"同じホストに別の店があります（要確認）: {others}" if others else "",
-                        source=f"osm:{area}")
+            add_company(
+                conn,
+                counts,
+                name=shops[0][0],
+                url=shops[0][1],
+                area=cities,
+                category=category,
+                stores=1,
+                segment=segment,
+                notes=f"同じホストに別の店があります（要確認）: {others}" if others else "",
+                source=f"osm:{area}",
+            )
             continue
         # 系列店。サイトの入口のURLは、登録されていたURLから作る（www の有無や http/https を変えない）
         base = urlsplit(g["top"] or min((u for _, u in shops), key=len))
-        add_company(conn, counts, name=operator or brand or sorted(g["names"])[0],
-                    url=f"{base.scheme}://{base.netloc}/", area=cities, category=category,
-                    stores=len(shops), segment=segment,
-                    notes="地図上の店: " + "、".join(n for n, _ in shops[:8]), source=f"osm:{area}")
+        add_company(
+            conn,
+            counts,
+            name=operator or brand or sorted(g["names"])[0],
+            url=f"{base.scheme}://{base.netloc}/",
+            area=cities,
+            category=category,
+            stores=len(shops),
+            segment=segment,
+            notes="地図上の店: " + "、".join(n for n, _ in shops[:8]),
+            source=f"osm:{area}",
+        )
     conn.commit()
     log(f"地図に公式サイトの登録がある店 {len(elements)}件 → サイト単位で {len(groups)}社")
     return counts
@@ -206,11 +236,17 @@ def _run_claude(prompt: str, timeout: int) -> str:
     if not exe:
         raise DiscoverError("claude コマンドが見つかりません。Claude Code を入れてログインしてから実行してください")
     cmd = [
-        exe, "-p", prompt,
-        "--output-format", "json",
-        "--tools", "WebSearch",
-        "--allowedTools", "WebSearch",
-        "--json-schema", json.dumps(SEARCH_SCHEMA, ensure_ascii=False),
+        exe,
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--tools",
+        "WebSearch",
+        "--allowedTools",
+        "WebSearch",
+        "--json-schema",
+        json.dumps(SEARCH_SCHEMA, ensure_ascii=False),
         "--strict-mcp-config",
         "--no-session-persistence",
     ]
@@ -227,8 +263,10 @@ def _run_claude(prompt: str, timeout: int) -> str:
         except (json.JSONDecodeError, AttributeError):
             detail = detail or done.stdout.strip()
         if re.search(r"authenticat|OAuth|log ?in", detail, re.I):
-            raise DiscoverError("Claude Code のログインが切れています。ターミナルで claude を起動し、"
-                                "/login でログインし直してから、もう一度実行してください")
+            raise DiscoverError(
+                "Claude Code のログインが切れています。ターミナルで claude を起動し、"
+                "/login でログインし直してから、もう一度実行してください"
+            )
         raise DiscoverError(f"claude コマンドが失敗しました: {detail[:300]}")
     return done.stdout
 
@@ -278,11 +316,16 @@ def discover_search(
             break  # 入れる数は --limit まで
         stores = c.get("stores")
         added = add_company(
-            conn, counts,
-            name=str(c.get("name") or ""), url=str(c.get("url") or ""),
-            area=str(c.get("area") or ""), category=str(c.get("category") or ""),
+            conn,
+            counts,
+            name=str(c.get("name") or ""),
+            url=str(c.get("url") or ""),
+            area=str(c.get("area") or ""),
+            category=str(c.get("category") or ""),
             stores=stores if isinstance(stores, int) and not isinstance(stores, bool) and 0 < stores < 10000 else None,
-            segment=segment, notes=str(c.get("note") or ""), source=f"search:{query}",
+            segment=segment,
+            notes=str(c.get("note") or ""),
+            source=f"search:{query}",
         )
         if added:
             log(f"[追加] {c.get('name')} {c.get('url')}")

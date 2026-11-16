@@ -3,6 +3,7 @@
 宛先は db.sendable_contacts() が返したものだけ。署名（送信者名・住所・停止の連絡先）は
 ここで必ず付けるので、ひな形から消すことはできない（特定電子メール法の表示義務）。
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -48,28 +49,31 @@ def load_template(path: Path) -> Template:
     return Template(name=path.stem, subject=subject, body=body)
 
 
-def footer(cfg: Config) -> str:
+def footer(cfg: Config, via_form: bool = False) -> str:
     contact = []
     if cfg.get("SENDER_TEL"):
         contact.append(f"電話 {cfg.get('SENDER_TEL')}")
     contact.append(f"メール {cfg.get('SENDER_EMAIL')}")
     optout = cfg.optout_email
     reply_target = cfg.get("REPLY_TO") or cfg.get("SENDER_EMAIL")
+    # フォームから送るときは「このメールに返信」が通じないので、必ず宛先を書く
     how = (
         "このメールに「不要」とご返信ください。"
-        if optout.lower() == reply_target.lower()
+        if optout.lower() == reply_target.lower() and not via_form
         else f"{optout} 宛に「不要」とお送りください。"
     )
-    return "\n".join([
-        RULE,
-        f"{cfg.get('SENDER_COMPANY')}　{cfg.get('SENDER_PERSON')}",
-        cfg.get("SENDER_ADDRESS"),
-        "／".join(contact),
-        f"今後のご案内が不要な場合は、{how}以後お送りしません。",
-    ])
+    return "\n".join(
+        [
+            RULE,
+            f"{cfg.get('SENDER_COMPANY')}　{cfg.get('SENDER_PERSON')}",
+            cfg.get("SENDER_ADDRESS"),
+            "／".join(contact),
+            f"今後のご案内が不要な場合は、{how}以後お送りしません。",
+        ]
+    )
 
 
-def render(template: Template, cfg: Config, contact: sqlite3.Row | dict) -> tuple[str, str]:
+def render(template: Template, cfg: Config, contact: sqlite3.Row | dict, via_form: bool = False) -> tuple[str, str]:
     """(件名, 本文) を返す。埋められない差し込みが残っていたら止める。"""
     values = {
         "会社名": contact["name"],
@@ -89,10 +93,11 @@ def render(template: Template, cfg: Config, contact: sqlite3.Row | dict) -> tupl
             if not value:
                 raise TemplateError(f"差し込み {{{{{key}}}}} に入れる値がありません")
             return value
+
         return PLACEHOLDER_RE.sub(sub, text)
 
     subject = " ".join(fill(template.subject).split())
-    body = fill(template.body).rstrip() + "\n\n" + footer(cfg) + "\n"
+    body = fill(template.body).rstrip() + "\n\n" + footer(cfg, via_form) + "\n"
     return subject, body
 
 
@@ -138,6 +143,7 @@ class SendSummary:
     skipped_limit: int = 0
     unknown: int = 0
     stopped: str = ""  # 途中で止めた理由
+    skipped: int = 0
 
 
 # 宛先そのものが存在しないときだけ「不達」にする。中継拒否や認証の失敗は設定の問題なので連絡先は触らない
@@ -168,6 +174,7 @@ def _send_lock(cfg: Config):
     try:
         try:
             import fcntl
+
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except ImportError:
             pass  # Windows など。1本ずつ動かしてください
@@ -209,8 +216,15 @@ def send_batch(
         return _send_live(conn, cfg, template, segment, limit, log, sleep)
 
 
-def _prepare(conn: sqlite3.Connection, cfg: Config, template: Template, segment: str | None,
-             limit: int | None, live: bool, summary: SendSummary) -> list[tuple[sqlite3.Row, str, str]]:
+def _prepare(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    template: Template,
+    segment: str | None,
+    limit: int | None,
+    live: bool,
+    summary: SendSummary,
+) -> list[tuple[sqlite3.Row, str, str]]:
     targets = db.sendable_contacts(conn, segment=segment)
     summary.planned = len(targets)
     cap = plan_count(conn, cfg, len(targets), limit, live)
@@ -219,8 +233,14 @@ def _prepare(conn: sqlite3.Connection, cfg: Config, template: Template, segment:
     return [(row, *render(template, cfg, row)) for row in targets[:cap]]
 
 
-def _write_drafts(conn: sqlite3.Connection, cfg: Config, template: Template, segment: str | None,
-                  limit: int | None, log: Callable[[str], None]) -> SendSummary:
+def _write_drafts(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    template: Template,
+    segment: str | None,
+    limit: int | None,
+    log: Callable[[str], None],
+) -> SendSummary:
     summary = SendSummary()
     prepared = _prepare(conn, cfg, template, segment, limit, False, summary)
     if not prepared:
@@ -242,8 +262,15 @@ def _write_drafts(conn: sqlite3.Connection, cfg: Config, template: Template, seg
     return summary
 
 
-def _send_live(conn: sqlite3.Connection, cfg: Config, template: Template, segment: str | None,
-               limit: int | None, log: Callable[[str], None], sleep: Callable[[float], None]) -> SendSummary:
+def _send_live(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    template: Template,
+    segment: str | None,
+    limit: int | None,
+    log: Callable[[str], None],
+    sleep: Callable[[float], None],
+) -> SendSummary:
     summary = SendSummary()
     prepared = _prepare(conn, cfg, template, segment, limit, True, summary)
     if not prepared:
@@ -308,24 +335,32 @@ def _send_live(conn: sqlite3.Connection, cfg: Config, template: Template, segmen
                     continue  # 一時的な拒否。次回もう一度試す
                 earlier = conn.execute(
                     "SELECT COUNT(*) FROM sends WHERE contact_id=? AND status='failed' AND error LIKE '5%'",
-                    (row["contact_id"],)).fetchone()[0]
+                    (row["contact_id"],),
+                ).fetchone()[0]
                 if _is_no_such_user(code, text) or earlier >= 2:
                     # 宛先が存在しない（または別の日にも断られた）。次回以降は送らない
-                    conn.execute("UPDATE contacts SET status='bounced', decided_at=? WHERE id=?",
-                                 (db.now(), row["contact_id"]))
+                    conn.execute(
+                        "UPDATE contacts SET status='bounced', decided_at=? WHERE id=?", (db.now(), row["contact_id"])
+                    )
                     conn.commit()
                 refused_streak.append(row["contact_id"])
                 if len(refused_streak) >= 2:
                     # 続けて2社に断られたら、相手ではなくこちらの設定の問題を疑う。宛先不明の印は取り消す
                     marks = ",".join("?" * len(refused_streak))
-                    conn.execute(f"UPDATE contacts SET status='approved' WHERE status='bounced' AND id IN ({marks})",
-                                 refused_streak)
+                    conn.execute(
+                        f"UPDATE contacts SET status='approved' WHERE status='bounced' AND id IN ({marks})",
+                        refused_streak,
+                    )
                     conn.commit()
                     summary.stopped = "続けて断られました。SMTP の設定（送信元アドレスなど）を確認してください"
                     break
                 continue
-            except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError, smtplib.SMTPHeloError,
-                    smtplib.SMTPNotSupportedError) as e:
+            except (
+                smtplib.SMTPSenderRefused,
+                smtplib.SMTPDataError,
+                smtplib.SMTPHeloError,
+                smtplib.SMTPNotSupportedError,
+            ) as e:
                 finish(send_id, "failed", f"{type(e).__name__}: {e}")
                 summary.failed += 1
                 summary.stopped = f"サーバーが送信を受け付けません: {e}"

@@ -1,4 +1,5 @@
 """候補リスト（CSV）の取り込み。1行＝1社（または1店）の公式サイト。"""
+
 from __future__ import annotations
 
 import csv
@@ -61,9 +62,19 @@ def open_csv(path: Path) -> io.StringIO:
     raise ValueError(f"{path}: 文字コードを読めません。UTF-8 か Shift_JIS で保存してください")
 
 
-def add_company(conn: sqlite3.Connection, counts: dict[str, int], *, name: str, url: str,
-                area: str = "", category: str = "", stores: int | None = None,
-                segment: str = "", notes: str = "", source: str = "") -> bool:
+def add_company(
+    conn: sqlite3.Connection,
+    counts: dict[str, int],
+    *,
+    name: str,
+    url: str,
+    area: str = "",
+    category: str = "",
+    stores: int | None = None,
+    segment: str = "",
+    notes: str = "",
+    source: str = "",
+) -> bool:
     """候補を1社入れる。入れば True。counts に結果を数える。"""
     normalized = normalize_url(url)
     name = " ".join(unicodedata.normalize("NFKC", name or "").split())[:200]
@@ -79,8 +90,7 @@ def add_company(conn: sqlite3.Connection, counts: dict[str, int], *, name: str, 
         "INSERT OR IGNORE INTO companies"
         "(name, site_url, host, area, category, store_count, segment, notes, source, created_at)"
         " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (name, normalized, host, area[:100], category[:100], stores, segment[:50], notes[:500],
-         source[:200], db.now()),
+        (name, normalized, host, area[:100], category[:100], stores, segment[:50], notes[:500], source[:200], db.now()),
     )
     counts["added" if cur.rowcount else "duplicate"] += 1
     return cur.rowcount > 0
@@ -95,9 +105,16 @@ def import_csv(conn: sqlite3.Connection, path: Path, source: str = "") -> dict[s
             stores_raw = unicodedata.normalize("NFKC", _pick(row, "stores"))
             stores = int(stores_raw) if stores_raw.isascii() and stores_raw.isdigit() else None
             add_company(
-                conn, counts, name=_pick(row, "name"), url=_pick(row, "url"), area=_pick(row, "area"),
-                category=_pick(row, "category"), stores=stores, segment=_pick(row, "segment"),
-                notes=_pick(row, "notes"), source=source or path.name,
+                conn,
+                counts,
+                name=_pick(row, "name"),
+                url=_pick(row, "url"),
+                area=_pick(row, "area"),
+                category=_pick(row, "category"),
+                stores=stores,
+                segment=_pick(row, "segment"),
+                notes=_pick(row, "notes"),
+                source=source or path.name,
             )
     conn.commit()
     return counts

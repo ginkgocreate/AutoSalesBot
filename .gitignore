@@ -5,3 +5,4 @@ outbox/
 __pycache__/
 *.pyc
 .DS_Store
+.ruff_cache/

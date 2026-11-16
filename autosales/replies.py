@@ -3,6 +3,7 @@
 受信箱の未読・既読は変えない（BODY.PEEK で読む）。同じメールは Message-ID で二重に数えない。
 こちらが送ったメールと関係のないメールは、中身を保存しない。
 """
+
 from __future__ import annotations
 
 import base64
@@ -42,19 +43,28 @@ _WANTS_STOP = re.compile(r"やめて|止めて|しないで|結構|お断り|遠
 _OPTOUT_WEAK = re.compile(r"必要(?:ありません|ない|ございません)|要りません|いりません|結構です|間に合って")
 # 引用の見出し。この行だけ飛ばす（引用の本体は > 付きなので別に飛ばされる。下に返信が続くことがある）
 _QUOTE_INTRO_RE = re.compile(
-    r"^(On .{5,100} wrote:|\d{4}[年/\-].{3,80}(wrote|書きました|のメッセージ|のメール)[:：]?|\d{4}[年/\-].{3,100}<[^<>]+@[^<>]+>\s*[:：])$", re.I)
+    r"^(On .{5,100} wrote:|\d{4}[年/\-].{3,80}(wrote|書きました|のメッセージ|のメール)[:：]?|\d{4}[年/\-].{3,100}<[^<>]+@[^<>]+>\s*[:：])$",
+    re.I,
+)
 # ここから下は、転送された元のメール。相手が書いた文ではない
 _QUOTE_BLOCK_RE = re.compile(
-    r"^(-{2,}\s*Original Message|-{5,}|_{5,}|─{5,}|差出人\s*[:：]|From\s*[:：]|送信元\s*[:：]|送信者\s*[:：])", re.I)
+    r"^(-{2,}\s*Original Message|-{5,}|_{5,}|─{5,}|差出人\s*[:：]|From\s*[:：]|送信元\s*[:：]|送信者\s*[:：])", re.I
+)
 _QUOTED_LINE_RE = re.compile(r"^\s*[>＞]")
 # 番号と認める書き方（それ以外の数字は数えない。住所・日付・「3店舗」などを拾わないため）
-_CHOICE_ONLY = re.compile(r"^[(（「『【]?([1-4])[)）」』】]?\s*(?:番(?!地|号))?\s*(?:です|でお願いします|でお願いいたします)?[。.．!！]?$")
+_CHOICE_ONLY = re.compile(
+    r"^[(（「『【]?([1-4])[)）」』】]?\s*(?:番(?!地|号))?\s*(?:です|でお願いします|でお願いいたします)?[。.．!！]?$"
+)
 _CHOICE_HEAD = re.compile(r"^[(（「『【]?([1-4])(?:[)）」』】]|番(?!地|号)|\s*[、。.．:：](?!\s*[0-9])|\s+(?![0-9]))")
 _CHOICE_TAIL = re.compile(r"(?:は|→|[:：=]|。|番号|回答|No\.?)\s*([1-4])\s*(?:番)?[。.．]?$", re.I)
-_CHOICE_SAID = re.compile(r"(?<![0-9./:\-])([1-4])\s*(?:番(?!地|号))?\s*(?:です|でお願い|になります|が近い|に近い|に該当|かな|だと思)")
+_CHOICE_SAID = re.compile(
+    r"(?<![0-9./:\-])([1-4])\s*(?:番(?!地|号))?\s*(?:です|でお願い|になります|が近い|に近い|に該当|かな|だと思)"
+)
 _CHOICE_LIST = re.compile(r"(?<![0-9])[1-4]\s*(?:[、,と・&/〜~]|か|または|or)\s*[1-4](?![0-9])", re.I)
 _BOUNCE_LOCALS = {"mailer-daemon", "postmaster"}
-_NO_USER_TEXT = re.compile(r"user unknown|unknown user|no such user|does not exist|5\.1\.[1236]\b|mailbox not found", re.I)
+_NO_USER_TEXT = re.compile(
+    r"user unknown|unknown user|no such user|does not exist|5\.1\.[1236]\b|mailbox not found", re.I
+)
 
 
 @dataclass
@@ -178,6 +188,81 @@ def _sent_contacts(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+def _form_company(conn: sqlite3.Connection, from_addr: str) -> int | None:
+    """フォームで連絡した会社のうち、この差出人の会社を返す。結び付かなければ None。
+
+    サイトに載っていたアドレスと同じか、差出人のドメインがサイトと同じ（またはその下）のときだけ。
+    差出人がサイトの親ドメイン（貸しサーバーやサイト作成サービス）の場合は、別の会社かもしれないので結び付けない。
+    """
+    done = "EXISTS (SELECT 1 FROM form_sends fs WHERE fs.company_id=co.id AND fs.status IN ('sent','unknown','manual'))"
+    rows = conn.execute(
+        f"SELECT DISTINCT co.id FROM site_emails se JOIN companies co ON co.id=se.company_id WHERE se.email=? AND {done}",
+        (from_addr,),
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0][0]
+    domain = db.email_domain(from_addr)
+    if is_free_mail(domain):
+        return None
+    hosts = conn.execute(f"SELECT co.id, co.host FROM companies co WHERE {done}").fetchall()
+    exact = [cid for cid, host in hosts if domain == host]
+    if exact:
+        return exact[0]
+    below = [cid for cid, host in hosts if domain.endswith("." + host)]
+    return below[0] if len(below) == 1 else None
+
+
+# フォームの受付の控え（自動返信）。人の返事ではないので、返信にも停止にも数えない
+_RECEIPT = re.compile(
+    r"自動(?:返信|送信|配信|応答)|送信専用|配信専用|このメールは.{0,30}(?:自動|システム)|"
+    r"お問い?合わ?せ(?:を|の|内容)?.{0,12}(?:受け?付け|ありがとう|承り)|受付(?:完了|番号|いたしました|しました)|"
+    r"(?:下記|以下)の内容で.{0,12}(?:受け?付け|送信|承り)|担当者?より.{0,20}(?:ご連絡|ご返信|回答)|auto.?reply|autoresponder",
+    re.I,
+)
+_RECEIPT_LOCALS = {
+    "noreply",
+    "no-reply",
+    "no_reply",
+    "donotreply",
+    "do-not-reply",
+    "autoreply",
+    "auto-reply",
+    "auto",
+    "system",
+    "wordpress",
+    "mailer",
+    "info-noreply",
+    "form",
+}
+# These identify automation more strongly than a polite acknowledgement does.
+_AUTOMATED_RECEIPT = re.compile(
+    r"自動(?:返信|送信|配信|応答)|送信専用|配信専用|このメールは.{0,30}(?:自動|システム)|auto.?reply|autoresponder",
+    re.I,
+)
+# こちらの文面の目印。これより後は、控えに貼られたこちらの文面
+_OUR_MARKS = ("突然のご連絡失礼いたします", "今後のご案内が不要な場合")
+
+
+def _form_reply_text(text: str, company_name: str = "") -> tuple[str, bool]:
+    """フォーム経由の返信から、相手が書いた部分を取り出す。 (相手の文, 受付の控えか)"""
+    normalized = unicodedata.normalize("NFKC", text)
+    cut = min((normalized.find(m) for m in _OUR_MARKS if m in normalized), default=-1)
+    head = normalized if cut < 0 else normalized[:cut]
+    # こちらの文面の直前の行（宛名の「○○ ご担当者さま」など）も、こちらが書いたもの
+    if cut >= 0:
+        lines = head.rstrip().split("\n")
+        company_name = unicodedata.normalize("NFKC", company_name).strip()
+        while lines and (
+            re.search(r"ご担当者|さま$|様$|^\s*$|^[>＞\-─━=]+", lines[-1].strip())
+            or (company_name and lines[-1].strip() == company_name)
+        ):
+            lines.pop()
+        head = "\n".join(lines)
+    # Quoted automated text must not override the human response above it.
+    head = own_words(head)
+    return head, bool(_RECEIPT.search(head)) or (cut >= 0 and not head.strip())
+
+
 def _bounced_addresses(msg: EmailMessage, raw: bytes, text: str, sent: dict[str, int]) -> list[str] | None:
     """不達通知から、届かなかった宛先（こちらが送ったもの）を返す。不達通知でなければ None。"""
     statuses = [p for p in msg.walk() if p.get_content_type() == "message/delivery-status"]
@@ -196,8 +281,13 @@ def _bounced_addresses(msg: EmailMessage, raw: bytes, text: str, sent: dict[str,
                     failed.append(addr)
         return failed  # 遅延の通知（delayed / 4.x.x）は空で返り、何もしない
     haystack = (unicodedata.normalize("NFKC", raw.decode("utf-8", "replace")) + "\n" + text).lower()
-    if not _NO_USER_TEXT.search(haystack) and "undeliver" not in haystack and "delivery" not in haystack \
-            and "配信" not in haystack and "届" not in haystack:
+    if (
+        not _NO_USER_TEXT.search(haystack)
+        and "undeliver" not in haystack
+        and "delivery" not in haystack
+        and "配信" not in haystack
+        and "届" not in haystack
+    ):
         return None
     hits = []
     for addr in sent:
@@ -216,6 +306,7 @@ def process_message(conn: sqlite3.Connection, raw: bytes, own_addresses: set[str
     if not message_id:
         # Message-ID の無いメールも二重に数えないよう、中身から決まった印を作る
         import hashlib
+
         message_id = "<no-id-" + hashlib.sha256(raw).hexdigest()[:32] + ">"
     if conn.execute("SELECT 1 FROM replies WHERE message_id=?", (message_id,)).fetchone():
         return None
@@ -235,9 +326,9 @@ def process_message(conn: sqlite3.Connection, raw: bytes, own_addresses: set[str
             conn.execute("UPDATE contacts SET status='bounced', decided_at=? WHERE id=?", (received, sent[addr]))
             db.add_suppression(conn, addr, "不達")
         conn.execute(
-            "INSERT INTO replies(contact_id, message_id, from_addr, kind, snippet, received_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (sent[hit[0]], message_id, from_addr, "bounce", ", ".join(hit)[:200], received),
+            "INSERT INTO replies(contact_id, company_id, message_id, from_addr, kind, snippet, received_at)"
+            " VALUES (?, (SELECT company_id FROM contacts WHERE id=?), ?,?,?,?,?)",
+            (sent[hit[0]], sent[hit[0]], message_id, from_addr, "bounce", ", ".join(hit)[:200], received),
         )
         conn.commit()
         return "bounce"
@@ -247,38 +338,81 @@ def process_message(conn: sqlite3.Connection, raw: bytes, own_addresses: set[str
     thread_ids = _ids(str(msg.get("In-Reply-To") or "")) + _ids(str(msg.get("References") or ""))
     if thread_ids:
         marks = ",".join("?" * len(thread_ids))
-        contact_ids = [r[0] for r in conn.execute(
-            f"SELECT DISTINCT contact_id FROM sends WHERE status IN ('sent','unknown') AND message_id IN ({marks})",
-            thread_ids)]
+        contact_ids = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT contact_id FROM sends WHERE status IN ('sent','unknown') AND message_id IN ({marks})",
+                thread_ids,
+            )
+        ]
     if not contact_ids:
-        row = conn.execute(
-            "SELECT ct.id, ct.company_id FROM contacts ct WHERE ct.email=?", (from_addr,)
-        ).fetchone()
+        row = conn.execute("SELECT ct.id, ct.company_id FROM contacts ct WHERE ct.email=?", (from_addr,)).fetchone()
         if row is not None and db.company_contacted(conn, row["company_id"]):
             # 同じ会社の別のアドレス（確認待ちなど）から返ってきた場合も、その会社の返信として扱う
             sent_in_company = conn.execute(
                 "SELECT DISTINCT c.id FROM contacts c JOIN sends s ON s.contact_id=c.id "
-                "WHERE c.company_id=? AND s.status IN ('sent','unknown')", (row["company_id"],)).fetchall()
+                "WHERE c.company_id=? AND s.status IN ('sent','unknown')",
+                (row["company_id"],),
+            ).fetchall()
             contact_ids = [r[0] for r in sent_in_company]
     if not contact_ids:
         # 別の担当者のアドレスから返ってくることがある。送った先と同じドメインなら同じ会社とみなす
         domain = db.email_domain(from_addr)
         if not is_free_mail(domain):
             contact_ids = [cid for addr, cid in sent.items() if db.email_domain(addr) == domain]
-    if not contact_ids:
-        return None  # こちらが送った相手と結び付かないメールは、中身を保存しない
+    if contact_ids:
+        company_id = conn.execute("SELECT company_id FROM contacts WHERE id=?", (contact_ids[0],)).fetchone()[0]
+    else:
+        # フォームで連絡した会社からの返信（メールの送信記録が無いので、会社のサイトと照らす）
+        company_id = _form_company(conn, from_addr)
+        if company_id is None:
+            return None  # こちらが連絡した相手と結び付かないメールは、中身を保存しない
 
     subject = str(msg.get("Subject", ""))
     auto = str(msg.get("Auto-Submitted", "no")).strip().lower() not in ("", "no")
+    via_form = not contact_ids
+    if via_form:
+        # フォームに送ると、受付の控え（こちらの文面を貼った自動返信）が返ることが多い。
+        # 控えの中の「不要」「番号」はこちらが書いたものなので、返信にも停止にも数えない
+        company_name = conn.execute("SELECT name FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+        text, receipt = _form_reply_text(text, company_name)
+        normalized_subject = unicodedata.normalize("NFKC", subject)
+        reply_subject = bool(re.match(r"^\s*(?:re|返信)\s*[:：]", normalized_subject, re.I))
+        answer = classify_reply(text, subject=subject)
+        human_answer = answer.kind == "optout" or answer.choice is not None
+        definite_receipt = (
+            auto
+            or bool(_AUTOMATED_RECEIPT.search(text))
+            or (not reply_subject and bool(_AUTOMATED_RECEIPT.search(normalized_subject)))
+        )
+        likely_receipt = (
+            receipt or local in _RECEIPT_LOCALS or (not reply_subject and bool(_RECEIPT.search(normalized_subject)))
+        )
+        # Honor explicit answers over weak receipt hints, after removing our own quoted content.
+        if definite_receipt or (likely_receipt and not human_answer):
+            conn.execute(
+                "INSERT INTO replies(contact_id, company_id, message_id, from_addr, kind, snippet, received_at)"
+                " VALUES (NULL,?,?,?, 'auto', ?, ?)",
+                (company_id, message_id, from_addr, " ".join(text.split())[:200], received),
+            )
+            conn.commit()
+            return "auto"
     result = classify_reply(text, subject=subject, auto=auto)
-    if result.kind != "optout" and re.search(r"unsubscribe|配信停止", unicodedata.normalize("NFKC", subject), re.I) \
-            and not re.match(r"^\s*(re|返信)\s*[:：]", subject, re.I):
+    if (
+        result.kind != "optout"
+        and re.search(r"unsubscribe|配信停止", unicodedata.normalize("NFKC", subject), re.I)
+        and not re.match(r"^\s*(re|返信)\s*[:：]", subject, re.I)
+    ):
         result.kind = "optout"
     if result.kind == "optout":
         reason = "本人から停止の連絡"
         try:
             db.add_suppression(conn, from_addr, reason)
-            if not is_free_mail(db.email_domain(from_addr)):
+            if via_form:
+                # フォームで連絡した会社。会社のサイトのドメインを止める
+                host = conn.execute("SELECT host FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+                db.add_suppression(conn, host, reason)
+            elif not is_free_mail(db.email_domain(from_addr)):
                 # 本部などからの停止は、同じドメインの店すべてに効かせる
                 db.add_suppression(conn, db.email_domain(from_addr), reason)
         except ValueError:
@@ -288,9 +422,18 @@ def process_message(conn: sqlite3.Connection, raw: bytes, own_addresses: set[str
             if row:
                 db.add_suppression(conn, row["email"], reason)
     conn.execute(
-        "INSERT INTO replies(contact_id, message_id, from_addr, kind, choice, snippet, received_at)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (contact_ids[0], message_id, from_addr, result.kind, result.choice, result.snippet, received),
+        "INSERT INTO replies(contact_id, company_id, message_id, from_addr, kind, choice, snippet, received_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (
+            contact_ids[0] if contact_ids else None,
+            company_id,
+            message_id,
+            from_addr,
+            result.kind,
+            result.choice,
+            result.snippet,
+            received,
+        ),
     )
     conn.commit()
     return result.kind
@@ -326,9 +469,12 @@ def fetch_replies(
 ) -> dict[str, int]:
     if not cfg.get("IMAP_HOST"):
         raise SystemExit("IMAP_HOST が未設定です（.env）")
-    own = {a.lower() for a in (cfg.get("SENDER_EMAIL"), cfg.get("REPLY_TO"), cfg.optout_email,
-                               cfg.get("IMAP_USER")) if a and "@" in a}
-    counts = {"reply": 0, "optout": 0, "bounce": 0, "checked": 0, "unreadable": 0}
+    own = {
+        a.lower()
+        for a in (cfg.get("SENDER_EMAIL"), cfg.get("REPLY_TO"), cfg.optout_email, cfg.get("IMAP_USER"))
+        if a and "@" in a
+    }
+    counts = {"reply": 0, "optout": 0, "bounce": 0, "auto": 0, "checked": 0, "unreadable": 0}
     folder = cfg.get("IMAP_FOLDER") or "INBOX"
     try:
         imap = imaplib.IMAP4_SSL(cfg.get("IMAP_HOST"), cfg.get_int("IMAP_PORT"))

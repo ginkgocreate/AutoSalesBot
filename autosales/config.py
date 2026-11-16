@@ -1,4 +1,5 @@
 """設定の読み込み。.env（KEY=VALUE）と環境変数だけを使う。"""
+
 from __future__ import annotations
 
 import os
@@ -8,6 +9,8 @@ from pathlib import Path
 DEFAULTS = {
     "SENDER_COMPANY": "",
     "SENDER_PERSON": "",
+    "SENDER_PERSON_KANA": "",
+    "SENDER_ZIP": "",
     "SENDER_ADDRESS": "",
     "SENDER_TEL": "",
     "SENDER_EMAIL": "",

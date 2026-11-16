@@ -1,4 +1,5 @@
 """レビューで見つかった不具合の再発防止と、discover の確認。外にはつながない。"""
+
 from __future__ import annotations
 
 import http.server
@@ -15,8 +16,7 @@ from urllib.parse import unquote
 from autosales import cli, db
 from autosales.config import load_config
 from autosales.crawler import Crawler, Robots, crawl_pending
-from autosales.discover import (DiscoverError, build_overpass_query, discover_osm, discover_search,
-                                parse_search_output)
+from autosales.discover import DiscoverError, build_overpass_query, discover_osm, discover_search, parse_search_output
 from autosales.extract import extract_contacts, extract_emails, find_refusal, parse_html
 from autosales.mailer import TemplateError, _send_lock, load_template, plan_count, send_batch
 from autosales.replies import _imap_folder, classify_reply, process_message
@@ -58,7 +58,9 @@ class ExtractFixes(unittest.TestCase):
         for html in [
             "info＠shop.jp（迷惑メール対策のため＠を全角にしています。半角に変えて送信してください）",
             "&#105;&#110;&#102;&#111;&#64;shop.jp",
-            "info(a)shop.jp", "info【at】shop.jp", "info*shop.jp（*を@に）",
+            "info(a)shop.jp",
+            "info【at】shop.jp",
+            "info*shop.jp（*を@に）",
         ]:
             p = page(html)
             self.assertEqual(extract_emails(p), [], html)
@@ -197,12 +199,19 @@ class Base(unittest.TestCase):
         (self.root / "templates").mkdir()
         for name in ("honbu.txt", "show.txt"):
             (self.root / "templates" / name).write_text(
-                (ROOT / "templates" / name).read_text(encoding="utf-8"), encoding="utf-8")
+                (ROOT / "templates" / name).read_text(encoding="utf-8"), encoding="utf-8"
+            )
         self.env = {
-            "SENDER_COMPANY": "株式会社テスト", "SENDER_PERSON": "山田", "SENDER_ADDRESS": "奈良県奈良市1-1",
-            "SENDER_EMAIL": "sales@sender.test", "SERVICE_START": "2027年春",
-            "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(self.smtp.server_address[1]), "SMTP_SECURITY": "none",
-            "DAILY_LIMIT": "5", "SEND_INTERVAL_SEC": "0",
+            "SENDER_COMPANY": "株式会社テスト",
+            "SENDER_PERSON": "山田",
+            "SENDER_ADDRESS": "奈良県奈良市1-1",
+            "SENDER_EMAIL": "sales@sender.test",
+            "SERVICE_START": "2027年春",
+            "SMTP_HOST": "127.0.0.1",
+            "SMTP_PORT": str(self.smtp.server_address[1]),
+            "SMTP_SECURITY": "none",
+            "DAILY_LIMIT": "5",
+            "SEND_INTERVAL_SEC": "0",
         }
         self.cfg = load_config(self.root, env=self.env)
         self.conn = db.connect(self.cfg.path("DB_PATH"))
@@ -221,14 +230,16 @@ class Base(unittest.TestCase):
     def company(self, name: str, host: str, segment: str = "honbu", status: str = "new") -> int:
         cur = self.conn.execute(
             "INSERT INTO companies(name, site_url, host, segment, status, created_at) VALUES (?,?,?,?,?,?)",
-            (name, f"http://{host}:{self.port}/", host, segment, status, db.now()))
+            (name, f"http://{host}:{self.port}/", host, segment, status, db.now()),
+        )
         self.conn.commit()
         return cur.lastrowid
 
     def contact(self, company_id: int, email: str, status: str = "approved", flags: str = "") -> int:
         cur = self.conn.execute(
             "INSERT INTO contacts(company_id, email, source_url, flags, status, found_at) VALUES (?,?,?,?,?,?)",
-            (company_id, email, "https://x.test/", flags, status, db.now()))
+            (company_id, email, "https://x.test/", flags, status, db.now()),
+        )
         self.conn.commit()
         return cur.lastrowid
 
@@ -245,18 +256,21 @@ class Base(unittest.TestCase):
         return [r["email"] for r in db.sendable_contacts(self.conn)]
 
     def send(self, **kw):
-        return send_batch(self.conn, self.cfg, self.template, live=True, log=self.out.append,
-                          sleep=lambda _: None, **kw)
+        return send_batch(
+            self.conn, self.cfg, self.template, live=True, log=self.out.append, sleep=lambda _: None, **kw
+        )
 
 
 class CrawlFixes(Base):
     def test_redirect_into_disallowed_path_is_not_read(self) -> None:
-        _Sites.sites = {"rd": {
-            "/robots.txt": "User-agent: *\nDisallow: /private/\n",
-            "/": '<a href="/contact">お問い合わせ</a>',
-            "/contact": (302, "/private/contact.html"),
-            "/private/contact.html": "secret@rd.localhost",
-        }}
+        _Sites.sites = {
+            "rd": {
+                "/robots.txt": "User-agent: *\nDisallow: /private/\n",
+                "/": '<a href="/contact">お問い合わせ</a>',
+                "/contact": (302, "/private/contact.html"),
+                "/private/contact.html": "secret@rd.localhost",
+            }
+        }
         cid = self.company("転送社", "rd.localhost")
         self.crawl()
         self.assertNotIn("rd/private/contact.html", _Sites.hits)
@@ -275,12 +289,14 @@ class CrawlFixes(Base):
 
     def test_contact_page_is_read_first_and_refusal_found(self) -> None:
         nav = "".join(f'<a href="/shop-{i}">店舗情報{i}</a>' for i in range(8))
-        _Sites.sites = {"nav": {
-            "/": f'<a href="/company">会社概要</a>{nav}<a href="/お問い合わせ.html">お問い合わせ</a> info@nav.localhost',
-            "/company": "会社概要",
-            "/お問い合わせ.html": "営業メールは固くお断りいたします",
-            **{f"/shop-{i}": "店" for i in range(8)},
-        }}
+        _Sites.sites = {
+            "nav": {
+                "/": f'<a href="/company">会社概要</a>{nav}<a href="/お問い合わせ.html">お問い合わせ</a> info@nav.localhost',
+                "/company": "会社概要",
+                "/お問い合わせ.html": "営業メールは固くお断りいたします",
+                **{f"/shop-{i}": "店" for i in range(8)},
+            }
+        }
         cid = self.company("ナビ社", "nav.localhost")
         self.crawl()
         self.assertEqual(self.status(cid), "refused")
@@ -301,8 +317,10 @@ class CrawlFixes(Base):
             "clubx.group": {"/": "お問い合わせ: honbu@group.localhost"},
         }
         for order in (("group", "clubx.group"), ("clubx.group", "group")):
-            self.conn.executescript("DELETE FROM contacts; DELETE FROM crawl_log; DELETE FROM suppressions; "
-                                    "DELETE FROM site_emails; DELETE FROM companies;")
+            self.conn.executescript(
+                "DELETE FROM contacts; DELETE FROM crawl_log; DELETE FROM suppressions; "
+                "DELETE FROM site_emails; DELETE FROM companies;"
+            )
             for host in order:
                 self.company(host, f"{host}.localhost")
             self.crawl()
@@ -343,8 +361,10 @@ class CrawlFixes(Base):
         self.assertFalse(r.can_fetch("https://a.test/%e3%81%8a%e5%95%8f%e3%81%84%e5%90%88%e3%82%8f%e3%81%9b/"))
 
     def test_unrefuse_only_clears_the_snippets_a_person_saw(self) -> None:
-        site = {"/": '店頭での客引き・勧誘行為は一切お断りしております。<a href="/contact">お問い合わせ</a>',
-                "/contact": "info@g.localhost"}
+        site = {
+            "/": '店頭での客引き・勧誘行為は一切お断りしております。<a href="/contact">お問い合わせ</a>',
+            "/contact": "info@g.localhost",
+        }
         _Sites.sites = {"g": site}
         cid = self.company("G店", "g.localhost")
         self.crawl()
@@ -361,8 +381,10 @@ class CrawlFixes(Base):
 
     def test_one_bad_row_does_not_stop_the_crawl(self) -> None:
         _Sites.sites = {"ok2": {"/": "info@ok2.localhost"}}
-        self.conn.execute("INSERT INTO companies(name, site_url, host, created_at) VALUES ('壊れ','http://a..b/','a..b',?)",
-                          (db.now(),))
+        self.conn.execute(
+            "INSERT INTO companies(name, site_url, host, created_at) VALUES ('壊れ','http://a..b/','a..b',?)",
+            (db.now(),),
+        )
         cid = self.company("正常", "ok2.localhost")
         self.crawl()
         self.assertEqual(self.status(cid), "crawled")
@@ -440,8 +462,10 @@ class GateFixes(Base):
         # 停止が先・巡回が後 / サイトのURLで停止 / 連絡先に無い担当者のアドレスで停止
         _Sites.sites = {"x": {"/": "info@x.localhost tantou@x.localhost clubx.nara@gmail.com"}}
         for target in ("info@x.localhost", f"http://www.x.localhost:{self.port}/contact", "tanaka@x.localhost"):
-            self.conn.executescript("DELETE FROM contacts; DELETE FROM crawl_log; DELETE FROM suppressions; "
-                                    "DELETE FROM site_emails; DELETE FROM companies;")
+            self.conn.executescript(
+                "DELETE FROM contacts; DELETE FROM crawl_log; DELETE FROM suppressions; "
+                "DELETE FROM site_emails; DELETE FROM companies;"
+            )
             db.add_suppression(self.conn, target, "電話で停止依頼")
             self.company("X社", "x.localhost")
             self.crawl()
@@ -478,7 +502,12 @@ class GateFixes(Base):
         b = self.contact(self.company("B社", "b.test", status="crawled"), "info@b.test", status="pending")
         c = self.contact(self.company("C社", "c.test", status="refused"), "info@c.test", status="pending")
         path = self.root / "review.csv"
-        rows = [f"{a},ｏｋ,A社,info@a.test", f"{b},〇,B社,info@WRONG.test", f"{c},ok,C社,info@c.test", f"{a},たぶん,A社,info@a.test"]
+        rows = [
+            f"{a},ｏｋ,A社,info@a.test",
+            f"{b},〇,B社,info@WRONG.test",
+            f"{c},ok,C社,info@c.test",
+            f"{a},たぶん,A社,info@a.test",
+        ]
         path.write_bytes(("ID,判定,会社名,アドレス\r\n" + "\r\n".join(rows) + "\r\n").encode("cp932"))
         self.assertEqual(cli.main_for_test(self.cfg, self.conn, ["approve", "--csv", str(path)]), 1)
         self.assertEqual(self.sendable(), ["info@a.test"])
@@ -491,35 +520,56 @@ class ReplyFixes(Base):
         self.contact(1, "owner@s1.test", status="pending")
         self.ready("S2社", "info@s2.test")
         self.send()
-        self.mids = {r["email"]: r["message_id"] for r in self.conn.execute(
-            "SELECT ct.email, s.message_id FROM sends s JOIN contacts ct ON ct.id=s.contact_id")}
+        self.mids = {
+            r["email"]: r["message_id"]
+            for r in self.conn.execute(
+                "SELECT ct.email, s.message_id FROM sends s JOIN contacts ct ON ct.id=s.contact_id"
+            )
+        }
         self.n = 0
 
     def mail(self, from_addr: str, body: str, subject: str = "Re: ご提案", extra: str = "") -> str | None:
         self.n += 1
-        raw = (f"From: {from_addr}\r\nTo: sales@sender.test\r\nSubject: {subject}\r\n{extra}"
-               f"Message-ID: <r{self.n}@x.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n")
+        raw = (
+            f"From: {from_addr}\r\nTo: sales@sender.test\r\nSubject: {subject}\r\n{extra}"
+            f"Message-ID: <r{self.n}@x.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
+        )
         return process_message(self.conn, raw.encode("utf-8"), {"sales@sender.test"})
 
     def test_optout_wording_and_position(self) -> None:
-        long_mail = ("株式会社テスト\n山田様\n\nお世話になっております。\nS1の佐藤です。\nご連絡ありがとうございます。\n"
-                     "今後のご案内は不要です。\n配信停止をお願いいたします。")
-        quoted_first = "> 近いものを、番号だけご返信いただけますか。\n> 4 今は必要ない\n\n今後のメール送信はお控えください。"
+        long_mail = (
+            "株式会社テスト\n山田様\n\nお世話になっております。\nS1の佐藤です。\nご連絡ありがとうございます。\n"
+            "今後のご案内は不要です。\n配信停止をお願いいたします。"
+        )
+        quoted_first = (
+            "> 近いものを、番号だけご返信いただけますか。\n> 4 今は必要ない\n\n今後のメール送信はお控えください。"
+        )
         for text in (long_mail, quoted_first, "今後のご連絡はご遠慮ください。", "不要です"):
             self.assertEqual(classify_reply(text).kind, "optout", text)
 
     def test_interested_replies_are_not_counted_as_optout(self) -> None:
         for text, choice in [
-            ("工事不要なら興味があります。1です", 1), ("費用は不要ですか?詳しく聞きたいです", None),
-            ("打合せは火曜日で結構です。", None), ("ワンストップ(one-stop)で頼めるなら1", None),
-            ("説明は不要なので資料だけ送ってください", None), ("4", 4), ("4 今は必要ない", 4),
+            ("工事不要なら興味があります。1です", 1),
+            ("費用は不要ですか?詳しく聞きたいです", None),
+            ("打合せは火曜日で結構です。", None),
+            ("ワンストップ(one-stop)で頼めるなら1", None),
+            ("説明は不要なので資料だけ送ってください", None),
+            ("4", 4),
+            ("4 今は必要ない", 4),
         ]:
             r = classify_reply(text)
             self.assertEqual((r.kind, r.choice), ("reply", choice), text)
 
     def test_numbers_that_are_not_choices(self) -> None:
-        for text in ["3店舗あります", "2、3店舗あります。詳しく聞きたいです。", "2日後に電話ください",
-                     "11/4にお電話します", "2:00以降なら電話可能です", "1、2が当てはまります", "1と2です"]:
+        for text in [
+            "3店舗あります",
+            "2、3店舗あります。詳しく聞きたいです。",
+            "2日後に電話ください",
+            "11/4にお電話します",
+            "2:00以降なら電話可能です",
+            "1、2が当てはまります",
+            "1と2です",
+        ]:
             self.assertIsNone(classify_reply(text).choice, text)
         self.assertEqual(classify_reply("2店舗あります。1です").choice, 1)
 
@@ -534,9 +584,17 @@ class ReplyFixes(Base):
             self.assertEqual(classify_reply(text).kind, "optout", text)
 
     def test_ordinary_number_replies_and_signatures(self) -> None:
-        for text, want in [("1でお願いします", 1), ("２です", 2), ("1番", 1), ("①", 1), ("3 新店の予定があります", 3),
-                           ("番号は2", 2), ("1点だけ質問です", None), ("2ヶ月後に改装します", None),
-                           ("興味あります。\n\n山田\n奈良市大宮町1-2-3\n営業2部\nTEL 0742-33-1234", None)]:
+        for text, want in [
+            ("1でお願いします", 1),
+            ("２です", 2),
+            ("1番", 1),
+            ("①", 1),
+            ("3 新店の予定があります", 3),
+            ("番号は2", 2),
+            ("1点だけ質問です", None),
+            ("2ヶ月後に改装します", None),
+            ("興味あります。\n\n山田\n奈良市大宮町1-2-3\n営業2部\nTEL 0742-33-1234", None),
+        ]:
             self.assertEqual(classify_reply(text).choice, want, text)
         self.assertIsNone(classify_reply("3営業日以内に返信します\n1", auto=True).choice)
 
@@ -547,8 +605,12 @@ class ReplyFixes(Base):
 
     def test_iso2022jp_with_vendor_characters(self) -> None:
         body = "①".encode("euc_jis_2004")
-        raw = (b"From: info@s1.test\r\nSubject: Re\r\nMessage-ID: <iso@x.test>\r\n"
-               b"Content-Type: text/plain; charset=iso-2022-jp\r\n\r\n\x1b$B" + bytes(b & 0x7F for b in body) + b"\x1b(B\r\n")
+        raw = (
+            b"From: info@s1.test\r\nSubject: Re\r\nMessage-ID: <iso@x.test>\r\n"
+            b"Content-Type: text/plain; charset=iso-2022-jp\r\n\r\n\x1b$B"
+            + bytes(b & 0x7F for b in body)
+            + b"\x1b(B\r\n"
+        )
         self.assertEqual(process_message(self.conn, raw, {"sales@sender.test"}), "reply")
         self.assertEqual(self.conn.execute("SELECT choice FROM replies").fetchone()[0], 1)
 
@@ -594,13 +656,29 @@ class ReplyFixes(Base):
 
 class DiscoverTests(Base):
     def test_osm_groups_by_site_and_skips_portals(self) -> None:
-        payload = {"elements": [
-            {"tags": {"name": "ラウンジA 本店", "amenity": "bar", "website": "https://www.group-a.test/honten", "addr:city": "奈良市"}},
-            {"tags": {"name": "ラウンジA 2号店", "amenity": "bar", "contact:website": "https://group-a.test/", "addr:city": "橿原市"}},
-            {"tags": {"name": "バーB", "amenity": "bar", "website": "bar-b.test"}},
-            {"tags": {"name": "居酒屋C", "amenity": "bar", "website": "https://r.gnavi.co.jp/abc/"}},
-            {"tags": {"amenity": "bar", "website": "https://noname.test/"}},
-        ]}
+        payload = {
+            "elements": [
+                {
+                    "tags": {
+                        "name": "ラウンジA 本店",
+                        "amenity": "bar",
+                        "website": "https://www.group-a.test/honten",
+                        "addr:city": "奈良市",
+                    }
+                },
+                {
+                    "tags": {
+                        "name": "ラウンジA 2号店",
+                        "amenity": "bar",
+                        "contact:website": "https://group-a.test/",
+                        "addr:city": "橿原市",
+                    }
+                },
+                {"tags": {"name": "バーB", "amenity": "bar", "website": "bar-b.test"}},
+                {"tags": {"name": "居酒屋C", "amenity": "bar", "website": "https://r.gnavi.co.jp/abc/"}},
+                {"tags": {"amenity": "bar", "website": "https://noname.test/"}},
+            ]
+        }
         seen: list[str] = []
 
         def fetch(query: str, ua: str) -> dict:
@@ -619,59 +697,120 @@ class DiscoverTests(Base):
             build_overpass_query("奈良県", ["unknown"])
 
     def test_osm_chains_shared_hosts_and_truncated_answers(self) -> None:
-        payload = {"elements": [
-            # 同じ屋号の系列店（店名は branch）。www 付き・http のサイト
-            {"type": "node", "id": 1, "tags": {"name": "HUB", "branch": "東梅田店", "brand": "HUB", "operator": "株式会社ハブ",
-                                               "amenity": "bar", "website": "http://www.hub.test/shop/a"}},
-            {"type": "node", "id": 2, "tags": {"name": "HUB", "branch": "なんば店", "brand": "HUB", "operator": "株式会社ハブ",
-                                               "amenity": "bar", "website": "http://www.hub.test/shop/b"}},
-            # ホームページ作成サービスに相乗りしている、無関係な2店
-            {"type": "node", "id": 3, "tags": {"name": "スナック花", "amenity": "bar", "website": "https://r.builder.test/hana"}},
-            {"type": "node", "id": 4, "tags": {"name": "バー月", "amenity": "bar", "website": "https://r.builder.test/tsuki"}},
-        ]}
+        payload = {
+            "elements": [
+                # 同じ屋号の系列店（店名は branch）。www 付き・http のサイト
+                {
+                    "type": "node",
+                    "id": 1,
+                    "tags": {
+                        "name": "HUB",
+                        "branch": "東梅田店",
+                        "brand": "HUB",
+                        "operator": "株式会社ハブ",
+                        "amenity": "bar",
+                        "website": "http://www.hub.test/shop/a",
+                    },
+                },
+                {
+                    "type": "node",
+                    "id": 2,
+                    "tags": {
+                        "name": "HUB",
+                        "branch": "なんば店",
+                        "brand": "HUB",
+                        "operator": "株式会社ハブ",
+                        "amenity": "bar",
+                        "website": "http://www.hub.test/shop/b",
+                    },
+                },
+                # ホームページ作成サービスに相乗りしている、無関係な2店
+                {
+                    "type": "node",
+                    "id": 3,
+                    "tags": {"name": "スナック花", "amenity": "bar", "website": "https://r.builder.test/hana"},
+                },
+                {
+                    "type": "node",
+                    "id": 4,
+                    "tags": {"name": "バー月", "amenity": "bar", "website": "https://r.builder.test/tsuki"},
+                },
+            ]
+        }
         discover_osm(self.conn, "大阪市", fetch=lambda q, ua: payload, log=self.out.append)
         rows = {r["host"]: r for r in self.conn.execute("SELECT * FROM companies")}
-        self.assertEqual((rows["hub.test"]["name"], rows["hub.test"]["store_count"], rows["hub.test"]["site_url"]),
-                         ("株式会社ハブ", 2, "http://www.hub.test/"))
-        self.assertEqual((rows["r.builder.test"]["name"], rows["r.builder.test"]["store_count"],
-                          rows["r.builder.test"]["site_url"]), ("スナック花", 1, "https://r.builder.test/hana"))
+        self.assertEqual(
+            (rows["hub.test"]["name"], rows["hub.test"]["store_count"], rows["hub.test"]["site_url"]),
+            ("株式会社ハブ", 2, "http://www.hub.test/"),
+        )
+        self.assertEqual(
+            (rows["r.builder.test"]["name"], rows["r.builder.test"]["store_count"], rows["r.builder.test"]["site_url"]),
+            ("スナック花", 1, "https://r.builder.test/hana"),
+        )
         self.assertIn("バー月", rows["r.builder.test"]["notes"])
         with self.assertRaises(DiscoverError):
-            discover_osm(self.conn, "大阪府", fetch=lambda q, ua: {"elements": [], "remark": "runtime error: Query timed out"},
-                         log=self.out.append)
+            discover_osm(
+                self.conn,
+                "大阪府",
+                fetch=lambda q, ua: {"elements": [], "remark": "runtime error: Query timed out"},
+                log=self.out.append,
+            )
 
     def test_search_limit_and_internal_addresses(self) -> None:
         cands = [{"name": f"会社{i}", "url": f"https://c{i}.test/"} for i in range(8)]
-        cands[:0] = [{"name": "内部", "url": "http://127.0.0.1/"}, {"name": "メタ", "url": "http://169.254.169.254/latest/"}]
+        cands[:0] = [
+            {"name": "内部", "url": "http://127.0.0.1/"},
+            {"name": "メタ", "url": "http://169.254.169.254/latest/"},
+        ]
         out = json.dumps({"structured_output": {"candidates": cands}})
         c = discover_search(self.conn, "x", limit=3, run=lambda p, t: out, log=self.out.append)
         self.assertEqual((c["added"], c["invalid"]), (3, 2))
 
     def test_search_candidates_go_through_the_same_checks(self) -> None:
-        out = {"result": "done", "structured_output": {"candidates": [
-            {"name": "株式会社ナイトグループ", "url": "https://night-group.test/", "area": "大阪市", "category": "キャバクラ", "stores": 5, "note": "x"},
-            {"name": "ポータル", "url": "https://www.instagram.com/abc", "stores": None},
-            {"name": "", "url": "https://x.test"},
-            {"name": "変なURL", "url": "javascript:alert(1)"},
-            "文字列",
-        ]}}
+        out = {
+            "result": "done",
+            "structured_output": {
+                "candidates": [
+                    {
+                        "name": "株式会社ナイトグループ",
+                        "url": "https://night-group.test/",
+                        "area": "大阪市",
+                        "category": "キャバクラ",
+                        "stores": 5,
+                        "note": "x",
+                    },
+                    {"name": "ポータル", "url": "https://www.instagram.com/abc", "stores": None},
+                    {"name": "", "url": "https://x.test"},
+                    {"name": "変なURL", "url": "javascript:alert(1)"},
+                    "文字列",
+                ]
+            },
+        }
         prompts: list[str] = []
 
         def run(prompt: str, timeout: int) -> str:
             prompts.append(prompt)
             return json.dumps(out)
 
-        c = discover_search(self.conn, "大阪 キャバクラ グループ 運営会社", segment="honbu", run=run, log=self.out.append)
+        c = discover_search(
+            self.conn, "大阪 キャバクラ グループ 運営会社", segment="honbu", run=run, log=self.out.append
+        )
         self.assertEqual(c, {"added": 1, "duplicate": 0, "invalid": 2, "non_official": 1})
         row = self.conn.execute("SELECT * FROM companies").fetchone()
-        self.assertEqual((row["name"], row["store_count"], row["segment"], row["status"]),
-                         ("株式会社ナイトグループ", 5, "honbu", "new"))
+        self.assertEqual(
+            (row["name"], row["store_count"], row["segment"], row["status"]),
+            ("株式会社ナイトグループ", 5, "honbu", "new"),
+        )
         self.assertIn("大阪 キャバクラ", prompts[0])
 
     def test_search_output_parsing(self) -> None:
         text = json.dumps({"result": '候補です。\n```json\n[{"name": "A", "url": "https://a.test"}]\n```'})
         self.assertEqual(parse_search_output(text), [{"name": "A", "url": "https://a.test"}])
-        for bad in ["not json", json.dumps({"result": "見つかりませんでした"}), json.dumps({"is_error": True, "result": "x"})]:
+        for bad in [
+            "not json",
+            json.dumps({"result": "見つかりませんでした"}),
+            json.dumps({"is_error": True, "result": "x"}),
+        ]:
             with self.assertRaises(DiscoverError):
                 parse_search_output(bad)
 
