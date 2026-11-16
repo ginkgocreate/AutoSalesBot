@@ -44,6 +44,77 @@ class DiscoverError(Exception):
     pass
 
 
+class SearchUnavailableError(DiscoverError):
+    """A provider availability failure that permits an explicitly configured fallback."""
+
+    _MESSAGES = {
+        "missing_cli": "claude コマンドを利用できません。インストール状況を確認してください。",
+        "authentication": "Claude Code の認証を利用できません。claude の /login で確認してください。",
+        "rate_limit": "Claude Code の検索が利用上限に達しました。時間を置いて再実行してください。",
+        "timeout": "Claude Code の検索が制限時間内に終わりませんでした。",
+    }
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(self._MESSAGES[reason])
+
+
+def _availability_reason(detail: str) -> str | None:
+    """Classify provider errors without exposing the provider's raw output."""
+    if re.search(
+        r"authentication.{0,30}(?:error|failed|required|missing|expired|invalid|unavailable)|"
+        r"unauthori[sz]ed|OAuth.{0,40}(?:expired|invalid)|not logged in|"
+        r"(?:please|must).{0,30}(?:/login|log in)|login required|(?:invalid|missing) API key",
+        detail,
+        re.I,
+    ):
+        return "authentication"
+    if re.search(
+        r"rate[_ -]?limit|too many requests|quota.{0,30}(?:limit|exceeded|exhausted)|"
+        r"(?:\d+[ -]?hour|usage|weekly|daily|monthly|session).{0,30}limit|you've hit your limit",
+        detail,
+        re.I,
+    ):
+        return "rate_limit"
+    return None
+
+
+def _contains_result_fragment(detail: str) -> bool:
+    """Accept complete provider error envelopes, but preserve any other JSON output."""
+    remaining = detail
+    decoder = json.JSONDecoder()
+    while match := re.search(r"[\[{]", remaining):
+        fragment = remaining[match.start() :]
+        try:
+            value, end = decoder.raw_decode(fragment)
+        except json.JSONDecodeError:
+            return True
+        if not isinstance(value, dict) or not set(value).issubset({"type", "error", "request_id"}):
+            return True
+        error = value.get("error")
+        if (
+            value.get("type") not in (None, "error")
+            or not isinstance(error, dict)
+            or not set(error).issubset({"type", "message", "request_id"})
+            or not isinstance(error.get("type"), str)
+        ):
+            return True
+        message = error.get("message", "")
+        if not isinstance(message, str) or _contains_result_fragment(message):
+            return True
+        remaining = fragment[end:]
+    return False
+
+
+def _raise_search_failure(detail: str) -> None:
+    if _contains_result_fragment(detail):
+        raise DiscoverError("検索が途中の結果を含めて終了しました。結果を確認してから再実行してください。")
+    reason = _availability_reason(detail)
+    if reason:
+        raise SearchUnavailableError(reason)
+    raise DiscoverError("Claude Code の検索処理が失敗しました。検索条件とCLIの状態を確認してください。")
+
+
 def _new_counts() -> dict[str, int]:
     return {"added": 0, "duplicate": 0, "invalid": 0, "non_official": 0}
 
@@ -84,11 +155,14 @@ def discover_osm(
     user_agent: str = "AutoSalesBot/0.1",
     log: Callable[[str], None] = print,
     fetch: Callable[[str, str], dict] = _fetch_overpass,
+    limit: int | None = None,
 ) -> dict[str, int]:
     """地域名（例: 奈良県、大阪市）の中で、公式サイトが登録されている店を集める。
 
     同じサイトの店は1社にまとめ、店舗数を数える（系列店の見当になる）。
     """
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+        raise DiscoverError("取得件数の上限は1以上の整数で指定してください")
     kinds = list(kinds or DEFAULT_OSM_KINDS)
     data = fetch(build_overpass_query(area, kinds), user_agent)
     if not isinstance(data, dict):
@@ -149,6 +223,8 @@ def discover_osm(
 
     counts = _new_counts()
     for host, g in groups.items():
+        if limit is not None and counts["added"] >= limit:
+            break
         shops = g["shops"]
         operator = next(iter(g["operators"])) if len(g["operators"]) == 1 else ""
         brand = next(iter(g["brands"])) if len(g["brands"]) == 1 else ""
@@ -234,7 +310,7 @@ stores=運営している店舗数（分からなければ null）、note=条件
 def _run_claude(prompt: str, timeout: int) -> str:
     exe = shutil.which("claude")
     if not exe:
-        raise DiscoverError("claude コマンドが見つかりません。Claude Code を入れてログインしてから実行してください")
+        raise SearchUnavailableError("missing_cli")
     cmd = [
         exe,
         "-p",
@@ -255,19 +331,24 @@ def _run_claude(prompt: str, timeout: int) -> str:
         try:
             done = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as e:
-            raise DiscoverError(f"検索が {timeout} 秒以内に終わりませんでした") from e
+            if e.output:
+                raise DiscoverError(
+                    "検索が途中の出力を残して終了しました。結果を確認してから再実行してください。"
+                ) from e
+            raise SearchUnavailableError("timeout") from e
+        except (FileNotFoundError, PermissionError) as e:
+            raise SearchUnavailableError("missing_cli") from e
     if done.returncode != 0:
         detail = (done.stderr or "").strip()
-        try:
-            detail = str(json.loads(done.stdout).get("result") or detail)
-        except (json.JSONDecodeError, AttributeError):
-            detail = detail or done.stdout.strip()
-        if re.search(r"authenticat|OAuth|log ?in", detail, re.I):
-            raise DiscoverError(
-                "Claude Code のログインが切れています。ターミナルで claude を起動し、"
-                "/login でログインし直してから、もう一度実行してください"
-            )
-        raise DiscoverError(f"claude コマンドが失敗しました: {detail[:300]}")
+        if done.stdout.strip():
+            try:
+                outer = json.loads(done.stdout)
+            except json.JSONDecodeError as e:
+                raise DiscoverError("検索が不完全な出力を残して失敗しました。代替検索には切り替えません。") from e
+            if not isinstance(outer, dict) or outer.get("structured_output") is not None:
+                raise DiscoverError("検索結果を含む処理が失敗しました。結果を確認してから再実行してください。")
+            detail = str(outer.get("result") or detail)
+        _raise_search_failure(detail)
     return done.stdout
 
 
@@ -278,7 +359,9 @@ def parse_search_output(stdout: str) -> list[dict]:
     except json.JSONDecodeError as e:
         raise DiscoverError("検索結果を読めませんでした（JSONではありません）") from e
     if isinstance(outer, dict) and outer.get("is_error"):
-        raise DiscoverError(f"検索に失敗しました: {str(outer.get('result'))[:300]}")
+        if outer.get("structured_output") is not None:
+            raise DiscoverError("検索結果を含む処理が失敗しました。結果を確認してから再実行してください。")
+        _raise_search_failure(str(outer.get("result") or ""))
     structured = outer.get("structured_output") if isinstance(outer, dict) else None
     if isinstance(structured, dict) and isinstance(structured.get("candidates"), list):
         return [c for c in structured["candidates"] if isinstance(c, dict)]
@@ -331,3 +414,50 @@ def discover_search(
             log(f"[追加] {c.get('name')} {c.get('url')}")
     conn.commit()
     return counts
+
+
+def discover_search_with_fallback(
+    conn: sqlite3.Connection,
+    query: str,
+    segment: str = "",
+    limit: int = 20,
+    timeout: int = 900,
+    log: Callable[[str], None] = print,
+    run: Callable[[str, int], str] = _run_claude,
+    *,
+    fallback_osm_area: str | None = None,
+    fallback_osm_kinds: list[str] | None = None,
+    fallback_segment: str = "",
+    user_agent: str = "AutoSalesBot/0.1",
+    fetch: Callable[[str, str], dict] = _fetch_overpass,
+) -> dict[str, int]:
+    """Use map candidates only after a provider outage and explicit operator opt-in."""
+    if not query.strip():
+        raise DiscoverError("検索の言葉を指定してください")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise DiscoverError("取得件数の上限は1以上の整数で指定してください")
+    configured = fallback_osm_area is not None or fallback_osm_kinds is not None or bool(fallback_segment)
+    if configured:
+        if not fallback_osm_area or not fallback_osm_area.strip() or not fallback_osm_kinds:
+            raise DiscoverError("代替地図検索には地域と種類の両方を指定してください")
+        build_overpass_query(fallback_osm_area.strip(), fallback_osm_kinds)
+    try:
+        return discover_search(conn, query, segment=segment, limit=limit, timeout=timeout, log=log, run=run)
+    except SearchUnavailableError as error:
+        if not configured:
+            raise
+        log(str(error))
+        log(
+            f"代替検索: {fallback_osm_area.strip()} の地図登録の店舗候補を取得します。"
+            "元の会社検索と同じ条件ではないため、業態と運営会社を確認してください。"
+        )
+        return discover_osm(
+            conn,
+            fallback_osm_area.strip(),
+            kinds=fallback_osm_kinds,
+            segment=fallback_segment,
+            user_agent=user_agent,
+            log=log,
+            fetch=fetch,
+            limit=limit,
+        )

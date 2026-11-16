@@ -78,6 +78,23 @@ def cmd_init(cfg: Config, conn, args) -> int:
     return 0
 
 
+def cmd_doctor(cfg: Config, conn, args) -> int:
+    from .readiness import inspect_readiness
+
+    options = {"template_names": tuple(args.template)} if args.template else {}
+    report = inspect_readiness(cfg, **options)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print("運用前チェック（設定の確認のみ。実配信・到達・返信受信は未確認）")
+        stages = {"research": "リサーチ", "draft": "下書き", "email": "メール送信設定", "replies": "返信受信設定"}
+        for stage, label in stages.items():
+            print(f"{label}: {'準備済み' if report[stage + '_ready'] else '未準備'}")
+            for reason in report["blockers"].get(stage, []):
+                print(f"  - {reason}")
+    return int(bool(args.require and not report[args.require + "_ready"]))
+
+
 def cmd_import(cfg: Config, conn, args) -> int:
     path = Path(args.csv)
     if not path.is_file():
@@ -102,7 +119,25 @@ def cmd_discover(cfg: Config, conn, args) -> int:
         )
     else:
         print("Web検索で候補を探しています（数分かかります）…")
-        c = discover_search(conn, args.query, segment=args.segment or "", limit=args.limit or 20)
+        if args.fallback_osm_area or args.fallback_osm_kinds or args.fallback_segment:
+            from .discover import discover_search_with_fallback
+
+            c = discover_search_with_fallback(
+                conn,
+                args.query,
+                segment=args.segment or "",
+                limit=args.limit or 20,
+                fallback_osm_area=args.fallback_osm_area,
+                fallback_osm_kinds=(
+                    [kind.strip() for kind in args.fallback_osm_kinds.split(",") if kind.strip()]
+                    if args.fallback_osm_kinds
+                    else None
+                ),
+                fallback_segment=args.fallback_segment or "",
+                user_agent=cfg.get("CRAWL_USER_AGENT"),
+            )
+        else:
+            c = discover_search(conn, args.query, segment=args.segment or "", limit=args.limit or 20)
     after = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
     print(
         f"追加 {c['added']}社 / すでにある {c['duplicate']}社 / 不備 {c['invalid']}件 / "
@@ -746,6 +781,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help=".env とデータベースを用意する").set_defaults(func=cmd_init)
 
+    s = sub.add_parser("doctor", help="送信者・ひな形・送受信設定を、接続やDB更新なしで確認する")
+    s.add_argument("--json", action="store_true", help="設定値を含まないJSONで出力する")
+    s.add_argument(
+        "--require", choices=["research", "draft", "email", "replies"], help="指定段階が未準備なら終了コード1"
+    )
+    s.add_argument("--template", action="append", help="確認するひな形名（複数指定可、既定は標準4種）")
+    s.set_defaults(func=cmd_doctor)
+
     s = sub.add_parser("import", help="候補リスト（CSV）を取り込む")
     s.add_argument("csv")
     s.add_argument("--source", help="リストの出どころのメモ")
@@ -759,6 +802,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--kinds", help="osm の種類をカンマ区切りで（" + ", ".join(OSM_KINDS) + "）")
     s.add_argument("--segment", help="集めた候補に付ける層（例: honbu / show）")
     s.add_argument("--limit", type=_positive_int, help="search で集める最大件数（既定 20）")
+    s.add_argument("--fallback-osm-area", help="searchが利用不可の場合に調べる地図の地域（種類指定と併用）")
+    s.add_argument("--fallback-osm-kinds", help="代替地図検索の種類をカンマ区切りで明示する")
+    s.add_argument("--fallback-segment", help="代替の店舗候補に付ける層。検索側の層は引き継がない")
     s.set_defaults(func=cmd_discover)
 
     s = sub.add_parser("crawl", help="公式サイトを見て、公表アドレスを集める")
@@ -853,6 +899,8 @@ def main_for_test(cfg: Config, conn, argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = load_config()
+    if args.command == "doctor":
+        return _run(cfg, None, args)
     conn = db.connect(cfg.path("DB_PATH"))
     try:
         return _run(cfg, conn, args)
