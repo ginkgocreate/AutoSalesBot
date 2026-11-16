@@ -764,7 +764,13 @@ def build_plan(form: RawForm, page: ParsedPage, charset: str = "utf-8") -> Plan 
         item = {"name": f.name, "role": "empty", "label": label[:40]}
         described = _norm(f"{f.label} {f.placeholder} {_name_words(f)}").lower()
         required = _is_required(f)
-        hidden = f.styled_hidden or bool(_HONEYPOT.search(f"{f.name} {f.id} {f.cls} {f.label} {f.placeholder}".lower()))
+        honeypot = bool(_HONEYPOT.search(f"{f.name} {f.id} {f.cls} {f.label} {f.placeholder}".lower()))
+        hidden = f.styled_hidden or honeypot
+        conditional_hidden = (
+            f.styled_hidden
+            and not honeypot
+            and (f.tag == "select" or f.type in ("date", "time", "datetime-local") or _RESERVE.search(described))
+        )
         if not hidden and f.type != "hidden":
             # ラジオ・チェックは選択肢の文字（「ご予約について」など）ではなく、問いの見出しで見る
             topic = _norm(f.heading).lower() if f.type in ("radio", "checkbox") else described
@@ -776,6 +782,9 @@ def build_plan(form: RawForm, page: ParsedPage, charset: str = "utf-8") -> Plan 
             item.update(role="keep", value=f.value)
         elif f.type in _BUTTON_TYPES or f.tag == "button":
             continue
+        elif conditional_hidden:
+            # Hidden reservation controls can be enabled by client-side choices; they are not bot traps.
+            manual.append("表示が切り替わる可能性のある入力欄があります（予約・選択項目など）")
         elif hidden:
             item["role"] = "honeypot"  # 人には見えない欄。ブラウザと同じく空のまま送る
         elif f.type == "file":
