@@ -1,7 +1,8 @@
 """通しの確認。外には一切つながず、手元に立てた仮のWebサーバーとSMTPサーバーだけを使う。
 
-    python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 """
+
 from __future__ import annotations
 
 import csv
@@ -30,9 +31,9 @@ SITES = {
     # 普通の会社: トップにリンク、会社概要にアドレス、求人ページに応募用アドレス
     "ok": {
         "/": '<html><head><title>OK社</title></head><body><a href="/company">会社概要</a>'
-             '<a href="/recruit">求人</a><a href="/menu">メニュー</a><img src="/logo@2x.png"></body></html>',
+        '<a href="/recruit">求人</a><a href="/menu">メニュー</a><img src="/logo@2x.png"></body></html>',
         "/company": "<html><body><p>お問い合わせ: ｉｎｆｏ＠OK.localhost</p>"
-                    '<a href="mailto:info@ok.localhost?subject=hi">mail</a></body></html>',
+        '<a href="mailto:info@ok.localhost?subject=hi">mail</a></body></html>',
         "/recruit": "<html><head><title>求人</title></head><body>応募は saiyo@ok.localhost まで</body></html>",
         "/menu": "<html><body>menu@ok.localhost</body></html>",
     },
@@ -49,7 +50,9 @@ SITES = {
     # アドレスを崩して書いている
     "obf": {"/": "<html><body>連絡先: info[at]obf.localhost</body></html>"},
     # Shift_JIS のページ
-    "sjis": {"/": "<html><head><meta charset=\"Shift_JIS\"></head><body>連絡先 info@sjis.localhost 会社概要</body></html>"},
+    "sjis": {
+        "/": '<html><head><meta charset="Shift_JIS"></head><body>連絡先 info@sjis.localhost 会社概要</body></html>'
+    },
 }
 
 
@@ -139,13 +142,18 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual(extract_emails(page), ["info@shop.test", "sales@shop.test"])
 
     def test_adjacent_inline_tags_do_not_glue_text(self) -> None:
-        page = parse_html('<div><span>MAIL</span><a href="mailto:info@shop.test">info@shop.test</a></div>',
-                          "https://shop.test/")
+        page = parse_html(
+            '<div><span>MAIL</span><a href="mailto:info@shop.test">info@shop.test</a></div>', "https://shop.test/"
+        )
         self.assertEqual(extract_emails(page), ["info@shop.test"])
 
     def test_refusal_variants(self) -> None:
-        for text in ["営業メールはお断りしております", "セールス目的のご連絡はご遠慮ください",
-                     "当フォームからの売り込みは禁止です", "お断り：広告・宣伝のメール"]:
+        for text in [
+            "営業メールはお断りしております",
+            "セールス目的のご連絡はご遠慮ください",
+            "当フォームからの売り込みは禁止です",
+            "お断り：広告・宣伝のメール",
+        ]:
             self.assertIsNotNone(find_refusal(parse_html(f"<p>{text}</p>", "https://a.test/")), text)
         for text in ["営業時間 19:00〜LAST 定休日 月曜", "無断転載を禁止します", "ご予約はお電話で"]:
             self.assertIsNone(find_refusal(parse_html(f"<p>{text}</p>", "https://a.test/")), text)
@@ -213,12 +221,20 @@ class FlowTests(unittest.TestCase):
         (self.root / "templates").mkdir()
         for name in ("honbu.txt", "show.txt"):
             (self.root / "templates" / name).write_text(
-                (ROOT / "templates" / name).read_text(encoding="utf-8"), encoding="utf-8")
+                (ROOT / "templates" / name).read_text(encoding="utf-8"), encoding="utf-8"
+            )
         self.env = {
-            "SENDER_COMPANY": "株式会社テスト", "SENDER_PERSON": "山田", "SENDER_ADDRESS": "奈良県奈良市1-1",
-            "SENDER_TEL": "0742-00-0000", "SENDER_EMAIL": "sales@sender.test", "SERVICE_START": "2027年春",
-            "SMTP_HOST": "127.0.0.1", "SMTP_PORT": str(self.smtp_port), "SMTP_SECURITY": "none",
-            "DAILY_LIMIT": "2", "SEND_INTERVAL_SEC": "0",
+            "SENDER_COMPANY": "株式会社テスト",
+            "SENDER_PERSON": "山田",
+            "SENDER_ADDRESS": "奈良県奈良市1-1",
+            "SENDER_TEL": "0742-00-0000",
+            "SENDER_EMAIL": "sales@sender.test",
+            "SERVICE_START": "2027年春",
+            "SMTP_HOST": "127.0.0.1",
+            "SMTP_PORT": str(self.smtp_port),
+            "SMTP_SECURITY": "none",
+            "DAILY_LIMIT": "2",
+            "SEND_INTERVAL_SEC": "0",
         }
         self.cfg = load_config(self.root, env=self.env)
         self.conn = db.connect(self.cfg.path("DB_PATH"))
@@ -317,11 +333,13 @@ class FlowTests(unittest.TestCase):
         for i in range(3):
             self.conn.execute(
                 "INSERT INTO companies(name, site_url, host, segment, status, created_at) VALUES (?,?,?,?,?,?)",
-                (f"追加{i}社", f"https://extra{i}.test/", f"extra{i}.test", "honbu", "crawled", db.now()))
+                (f"追加{i}社", f"https://extra{i}.test/", f"extra{i}.test", "honbu", "crawled", db.now()),
+            )
             cid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             self.conn.execute(
                 "INSERT INTO contacts(company_id, email, source_url, status, found_at) VALUES (?,?,?,?,?)",
-                (cid, f"info@extra{i}.test", f"https://extra{i}.test/", "approved", db.now()))
+                (cid, f"info@extra{i}.test", f"https://extra{i}.test/", "approved", db.now()),
+            )
         self.conn.commit()
         db.add_suppression(self.conn, "info@ok.localhost", "テスト")
         db.add_suppression(self.conn, "extra0.test", "ドメインごと")
@@ -338,10 +356,12 @@ class FlowTests(unittest.TestCase):
     def test_rejected_recipient_is_marked_bounced(self) -> None:
         self.conn.execute(
             "INSERT INTO companies(name, site_url, host, status, created_at) VALUES ('消えた社','https://gone.test/','gone.test','crawled',?)",
-            (db.now(),))
+            (db.now(),),
+        )
         self.conn.execute(
             "INSERT INTO contacts(company_id, email, source_url, status, found_at) VALUES (1,'gone@gone.test','https://gone.test/','approved',?)",
-            (db.now(),))
+            (db.now(),),
+        )
         self.conn.commit()
         template = load_template(self.root / "templates" / "honbu.txt")
         s = send_batch(self.conn, self.cfg, template, live=True, log=self.log.append, sleep=lambda _: None)
@@ -364,9 +384,10 @@ class FlowTests(unittest.TestCase):
             render(template, cfg, row)
 
     def _reply(self, from_addr: str, body: str, mid: str, subject: str = "Re: ご提案") -> bytes:
-        return (f"From: {from_addr}\r\nTo: sales@sender.test\r\nSubject: {subject}\r\n"
-                f"Message-ID: <{mid}@x.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
-                ).encode("utf-8")
+        return (
+            f"From: {from_addr}\r\nTo: sales@sender.test\r\nSubject: {subject}\r\n"
+            f"Message-ID: <{mid}@x.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
+        ).encode("utf-8")
 
     def test_replies(self) -> None:
         self._seed(["ok", "sjis"])
@@ -381,11 +402,16 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(process_message(self.conn, self._reply("info@sjis.localhost", "不要", "b"), own), "optout")
         self.assertTrue(db.is_suppressed(self.conn, "info@sjis.localhost"))
         self.assertIsNone(process_message(self.conn, self._reply("someone@other.test", "こんにちは", "c"), own))
-        bounce = self._reply("MAILER-DAEMON@mx.test", "Delivery failed: <info@ok.localhost> user unknown", "d",
-                             subject="Undelivered Mail")
+        bounce = self._reply(
+            "MAILER-DAEMON@mx.test",
+            "Delivery failed: <info@ok.localhost> user unknown",
+            "d",
+            subject="Undelivered Mail",
+        )
         self.assertEqual(process_message(self.conn, bounce, own), "bounce")
         self.assertEqual(
-            self.conn.execute("SELECT status FROM contacts WHERE email='info@ok.localhost'").fetchone()[0], "bounced")
+            self.conn.execute("SELECT status FROM contacts WHERE email='info@ok.localhost'").fetchone()[0], "bounced"
+        )
         row = self.conn.execute("SELECT choice FROM replies WHERE kind='reply'").fetchone()
         self.assertEqual(row["choice"], 3)
 

@@ -6,11 +6,14 @@
   - 公式サイトの中だけを見る（ポータルやSNSは「自己の公表」に当たらないので対象外）
   - 「営業メールお断り」の類を見つけたら、その会社には送らない
 """
+
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import re
 import socket
+import ssl
 import sqlite3
 import time
 import urllib.error
@@ -21,6 +24,7 @@ from urllib.parse import quote, unquote, urldefrag, urljoin, urlsplit, urlunspli
 
 from . import db
 from .extract import Page, classify_email, extract_contacts, find_refusals, parse_html, site_host
+from .forms import Plan, find_contact_form, is_form_service
 
 MAX_BYTES = 1_500_000
 TIMEOUT = 15
@@ -29,15 +33,59 @@ ROBOTS_NAME = "autosalesbot"  # robots.txt の User-agent 行と照らす名前
 
 # ここに載っているのは公式サイトではないので、巡回もアドレスの採用もしない
 NON_OFFICIAL_HOSTS = (
-    "instagram.com", "x.com", "twitter.com", "facebook.com", "threads.net", "threads.com",
-    "tiktok.com", "youtube.com", "youtu.be", "line.me", "lin.ee", "ameblo.jp", "note.com",
-    "naramori.com", "hotpepper.jp", "tabelog.com", "gnavi.co.jp", "gorp.jp", "retty.me",
-    "google.com", "google.co.jp", "goo.gl", "g.page", "business.site", "itp.ne.jp", "ekiten.jp",
-    "pokepara.jp", "caba2.net", "nightsbridge.com", "host2.jp", "baitoru.com", "owst.jp",
-    "townwork.net", "indeed.com", "linktr.ee", "lit.link", "peraichi.com", "wikipedia.org",
-    "tripadvisor.jp", "tripadvisor.com", "yelp.com", "yelp.co.jp", "foursquare.com",
-    "favy.jp", "hitosara.com", "ozmall.co.jp", "ikyu.com", "jalan.net", "rakuten.co.jp",
-    "booking.com", "untappd.com", "yahoo.co.jp", "navitime.co.jp",
+    "instagram.com",
+    "x.com",
+    "twitter.com",
+    "facebook.com",
+    "threads.net",
+    "threads.com",
+    "tiktok.com",
+    "youtube.com",
+    "youtu.be",
+    "line.me",
+    "lin.ee",
+    "ameblo.jp",
+    "note.com",
+    "naramori.com",
+    "hotpepper.jp",
+    "tabelog.com",
+    "gnavi.co.jp",
+    "gorp.jp",
+    "retty.me",
+    "google.com",
+    "google.co.jp",
+    "goo.gl",
+    "g.page",
+    "business.site",
+    "itp.ne.jp",
+    "ekiten.jp",
+    "pokepara.jp",
+    "caba2.net",
+    "nightsbridge.com",
+    "host2.jp",
+    "baitoru.com",
+    "owst.jp",
+    "townwork.net",
+    "indeed.com",
+    "linktr.ee",
+    "lit.link",
+    "peraichi.com",
+    "wikipedia.org",
+    "tripadvisor.jp",
+    "tripadvisor.com",
+    "yelp.com",
+    "yelp.co.jp",
+    "foursquare.com",
+    "favy.jp",
+    "hitosara.com",
+    "ozmall.co.jp",
+    "ikyu.com",
+    "jalan.net",
+    "rakuten.co.jp",
+    "booking.com",
+    "untappd.com",
+    "yahoo.co.jp",
+    "navitime.co.jp",
 )
 
 # 連絡先ページ → 会社情報ページ → 規約ページ の順に見る。求人ページは応募専用アドレスの見分け用
@@ -54,7 +102,8 @@ _URL_SAFE = "/%:@!$&'()*+,;=~-._"
 
 
 class FetchError(Exception):
-    pass
+    # フォームの送信（POST）を出したあとの失敗。相手に届いたかもしれない
+    maybe_sent = False
 
 
 def is_non_official(host: str) -> bool:
@@ -76,9 +125,7 @@ def _is_public_host(host: str) -> bool:
 
 
 def _is_public_ip(ip) -> bool:  # noqa: ANN001
-    return bool(ip.is_global) and not (
-        ip.is_reserved or getattr(ip, "is_site_local", False) or ip.is_multicast
-    )
+    return bool(ip.is_global) and not (ip.is_reserved or getattr(ip, "is_site_local", False) or ip.is_multicast)
 
 
 def _ascii_url(url: str) -> str:
@@ -91,11 +138,17 @@ def _ascii_url(url: str) -> str:
             netloc += f":{parts.port}"
     except (ValueError, UnicodeError) as e:
         raise FetchError(f"URLを読めません: {url}") from e
-    return urlunsplit((parts.scheme, netloc, quote(parts.path, safe=_URL_SAFE),
-                       quote(parts.query, safe=_URL_SAFE + "?"), ""))
+    return urlunsplit(
+        (parts.scheme, netloc, quote(parts.path, safe=_URL_SAFE), quote(parts.query, safe=_URL_SAFE + "?"), "")
+    )
 
 
 def _decode(body: bytes, header_charset: str | None) -> str:
+    return _decode_with(body, header_charset)[0]
+
+
+def _decode_with(body: bytes, header_charset: str | None) -> tuple[str, str]:
+    """(文字列, 使った文字コード) を返す。フォームは、ページと同じ文字コードで送る。"""
     candidates: list[str] = []
     if header_charset:
         candidates.append(header_charset)
@@ -105,10 +158,52 @@ def _decode(body: bytes, header_charset: str | None) -> str:
     candidates += ["utf-8", "cp932", "euc_jp"]
     for enc in candidates:
         try:
-            return body.decode(enc)
+            return body.decode(enc), enc
         except (LookupError, UnicodeDecodeError):
             continue
-    return body.decode("utf-8", "replace")
+    return body.decode("utf-8", "replace"), "utf-8"
+
+
+def _guarded_handlers(allow_private: bool) -> list:
+    """つないだ直後、何かを送る前に、接続先が公開のアドレスかを確かめるハンドラー。
+
+    名前の引き直しで内部のアドレスに向けられた場合に、フォームの中身（POST）が届く前に止めるため。
+    """
+
+    def check(sock) -> None:  # noqa: ANN001
+        if allow_private:
+            return
+        try:
+            peer = sock.getpeername()[0]
+        except OSError:
+            return
+        if not _is_public_ip(ipaddress.ip_address(peer.split("%")[0])):
+            sock.close()
+            raise FetchError(f"公開サイトではありません: {peer}")
+
+    class GuardedHTTP(http.client.HTTPConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class GuardedHTTPS(http.client.HTTPSConnection):
+        def connect(self) -> None:
+            super().connect()
+            check(self.sock)
+
+    class HTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):  # noqa: ANN001, ANN202
+            return self.do_open(GuardedHTTP, req)
+
+    class HTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):  # noqa: ANN001, ANN202
+            return self.do_open(GuardedHTTPS, req, context=ssl.create_default_context())
+
+    return [HTTPHandler(), HTTPSHandler()]
+
+
+# つながる前の失敗。相手には1バイトも届いていない
+_NOT_CONNECTED = (ConnectionRefusedError, socket.gaierror, ssl.SSLCertVerificationError)
 
 
 class Robots:
@@ -186,6 +281,8 @@ class SiteResult:
     emails: dict[str, tuple[str, list[str]]] = field(default_factory=dict)  # email -> (掲載URL, フラグ)
     refusals: list[tuple[str, str]] = field(default_factory=list)  # (URL, 抜粋)
     obfuscated_url: str | None = None
+    form: Plan | None = None  # 見つけたお問い合わせフォーム
+    form_rank: tuple[int, int] = (9, 9)
     status: str = "no_email"
     note: str = ""
 
@@ -214,7 +311,18 @@ class Crawler:
             def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
                 return None  # 転送は自動で追わない。1つずつ確かめてから取りに行く
 
-        self._opener = urllib.request.build_opener(_NoRedirect())
+        self._no_redirect = _NoRedirect
+        self._opener = urllib.request.build_opener(_NoRedirect(), *_guarded_handlers(allow_private))
+
+    def new_session(self):  # noqa: ANN201
+        """クッキーを持ち回る入れ物。フォームのページを開いてから送るまでを、同じ訪問として扱うため。"""
+        import http.cookiejar
+
+        return urllib.request.build_opener(
+            self._no_redirect(),
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+            *_guarded_handlers(self.allow_private),
+        )
 
     # ---- 取得 ----
     def _check_url(self, url: str) -> None:
@@ -238,12 +346,28 @@ class Crawler:
         url: str,
         robots: Robots | None = None,
         stay_on: str | None = None,
+        *,
+        data: bytes | None = None,
+        content_type: str | None = None,
+        opener=None,  # noqa: ANN001
+        referer: str | None = None,
+        accept: str | None = None,
     ) -> tuple[str, int, str, bytes, str | None, bool]:
         """(最終URL, ステータス, Content-Type, 本文, 文字コード, 途中で切れたか) を返す。
 
         転送は最大 MAX_REDIRECTS 回まで手で追う。1回ごとに、同じサイトの中か（stay_on）、
         robots.txt で許されているか（robots）、公開サイトかを確かめる。
+        data を渡すと POST で送る（フォームの送信）。送ったあとの失敗は maybe_sent=True の FetchError。
         """
+        self._posted = False
+        self.redirected_after_post = False
+        try:
+            return self._open_inner(url, robots, stay_on, data, content_type, opener, referer, accept)
+        except FetchError as e:
+            e.maybe_sent = self._posted
+            raise
+
+    def _open_inner(self, url, robots, stay_on, data, content_type, opener, referer, accept):  # noqa: ANN001
         delay = robots.crawl_delay if robots else 0.0
         for _ in range(MAX_REDIRECTS + 1):
             url = _ascii_url(url)
@@ -253,28 +377,54 @@ class Crawler:
             if robots is not None and not robots.can_fetch(url):
                 raise FetchError("robots.txt で禁止されています")
             self._wait(urlsplit(url).hostname or "", delay)
-            req = urllib.request.Request(url, headers={
+            headers = {
                 "User-Agent": self.user_agent,
-                "Accept": "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.5",
+                "Accept": accept or "text/html,application/xhtml+xml;q=0.9,text/plain;q=0.5",
                 "Accept-Language": "ja,en;q=0.5",
-            })
+            }
+            if referer:
+                headers["Referer"] = referer
+            if data is not None:
+                headers["Content-Type"] = content_type or "application/x-www-form-urlencoded"
+                if referer:
+                    ref = urlsplit(referer)
+                    headers["Origin"] = f"{ref.scheme}://{ref.netloc}"
+            req = urllib.request.Request(url, data=data, headers=headers)
+            sending = data is not None
+            if sending:
+                self._posted = True
             try:
-                with self._opener.open(req, timeout=TIMEOUT) as resp:
+                with (opener or self._opener).open(req, timeout=TIMEOUT) as resp:
                     self._check_peer(resp)
                     body = resp.read(MAX_BYTES + 1)
-                    return (url, resp.status, resp.headers.get_content_type(),
-                            body[:MAX_BYTES], resp.headers.get_content_charset(), len(body) > MAX_BYTES)
+                    return (
+                        url,
+                        resp.status,
+                        resp.headers.get_content_type(),
+                        body[:MAX_BYTES],
+                        resp.headers.get_content_charset(),
+                        len(body) > MAX_BYTES,
+                    )
             except urllib.error.HTTPError as e:
                 location = e.headers.get("Location") if e.headers else None
                 code = e.code
                 e.close()
                 if code in (301, 302, 303, 307, 308) and location:
                     url = urljoin(url, location)
+                    if sending:
+                        self.redirected_after_post = True  # 送信そのものは受け付けられている
+                    if code not in (307, 308):
+                        data = None  # 送信後の転送先（完了ページなど）は、読むだけ
                     continue
                 return (url, code, "", b"", None, False)
             except FetchError:
+                if sending and not self.redirected_after_post:
+                    self._posted = False  # 接続先の確認で止めた。中身は送っていない
                 raise
             except Exception as e:  # タイムアウト・DNS・TLS など
+                reason = getattr(e, "reason", e)
+                if sending and not self.redirected_after_post and isinstance(reason, _NOT_CONNECTED + (FetchError,)):
+                    self._posted = False  # つながる前の失敗。相手には届いていない
                 raise FetchError(f"{type(e).__name__}: {e}") from e
         raise FetchError("転送が多すぎます")
 
@@ -344,7 +494,8 @@ class Crawler:
 
         while current is not None:
             url, status, ctype, body, charset, cut = current
-            fetched += 1
+            if kind != "frame":
+                fetched += 1  # フレームの中身（最大3ページ）は、ページ数の上限とは別に読む
             ok = False
             if status >= 400:
                 result.pages.append((url, "error", f"HTTP {status}"))
@@ -353,10 +504,15 @@ class Crawler:
             else:
                 ok = True
                 truncated = truncated or cut
-                page = parse_html(_decode(body, charset), url)
-                self._collect(result, page, kind == "recruit" or bool(_RECRUIT.search(page.title)))
-                if kind == "top":
-                    queue = self._pick_links(page, host, seen)
+                html, encoding = _decode_with(body, charset)
+                page = parse_html(html, url)
+                is_recruit = kind == "recruit" or bool(_RECRUIT.search(page.title))
+                self._collect(result, page, is_recruit)
+                if kind != "recruit":
+                    self._collect_form(result, html, page, encoding, kind, robots)
+                if kind in ("top", "frame"):
+                    # フレームで組まれたサイトは、中身のページからもリンクを拾う
+                    queue = self._merge_queue(queue, self._pick_links(page, host, seen))
                 result.pages.append((url, "ok", page.title[:80]))
             if kind == "contact" and not ok:
                 contact_unread = True
@@ -368,7 +524,8 @@ class Crawler:
                     current = self._open(next_url, robots=robots, stay_on=host)
                     break
                 except FetchError as e:
-                    fetched += 1
+                    if kind != "frame":
+                        fetched += 1
                     blocked = "robots.txt" in str(e)
                     result.pages.append((next_url, "blocked" if blocked else "error", str(e)))
                     if kind == "contact":
@@ -382,6 +539,8 @@ class Crawler:
         extra = (["contact_unread"] if contact_unread else []) + (["page_truncated"] if truncated else [])
         if extra:
             result.emails = {e: (src, flags + extra) for e, (src, flags) in result.emails.items()}
+            if result.form is not None:
+                result.form.flags = list(dict.fromkeys(result.form.flags + extra))
 
         if result.refusals:
             result.status = "refused"
@@ -409,8 +568,73 @@ class Crawler:
             if known is None or ("recruit" in known[1] and "recruit" not in flags):
                 result.emails[email] = (page.url, flags)
 
+    def _collect_form(
+        self, result: SiteResult, html: str, page: Page, encoding: str, kind: str, robots: Robots
+    ) -> None:
+        """お問い合わせフォームを探す。自動で送れるもの → 人が送るもの → 送らないもの、の順に良いものを残す。"""
+        try:
+            plan = find_contact_form(html, page.url, encoding)
+        except Exception:
+            plan = None  # フォームの読み取りの不備で、巡回全体を止めない
+        if plan is None:
+            # 公式サイトから、外部のフォームサービスへ案内している（Google フォームなど）
+            for href, text in page.links:
+                link_host = site_host(href)
+                if (
+                    href.lower().startswith(("http://", "https://"))
+                    and is_form_service(link_host)
+                    and (_CONTACT.search(text) or "form" in href.lower())
+                ):
+                    plan = Plan(
+                        mode="manual", kind="external", page_url=href, action=href, reason="外部のフォームサービスです"
+                    )
+                    break
+        if plan is None:
+            return
+        if plan.mode == "auto":
+            if not robots.can_fetch(plan.action):
+                plan.mode, plan.reason = "skip", "送信先が robots.txt で禁止されています"
+            elif plan.rest_url and not robots.can_fetch(plan.rest_url):
+                plan.rest_url = ""
+        if not plan.page_url.lower().startswith(("http://", "https://")):
+            return
+        # お問い合わせページのフォームを優先する（別のページの小さなフォームに、自動だからといって乗り換えない）
+        rank = (0 if kind == "contact" else 1, {"auto": 0, "manual": 1, "skip": 2}[plan.mode])
+        if rank < result.form_rank:
+            result.form, result.form_rank = plan, rank
+
+    @staticmethod
+    def _merge_queue(queue: list[tuple[str, str]], more: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        order = {"frame": 0, "contact": 1, "company": 2, "policy": 3, "recruit": 4}
+        merged = queue + [item for item in more if item not in queue]
+        # 4本目以降のお問い合わせページは後回し（_pick_links と同じ考え方）
+        contacts = [i for i in merged if i[1] == "contact"]
+        late = set(contacts[3:])
+        return sorted(merged, key=lambda i: 5 if i in late else order[i[1]])
+
     def _pick_links(self, page: Page, host: str, seen: set[str]) -> list[tuple[str, str]]:
-        buckets: dict[str, list[tuple[str, str]]] = {"contact": [], "company": [], "policy": [], "recruit": []}
+        buckets: dict[str, list[tuple[str, str]]] = {
+            "frame": [],
+            "contact": [],
+            "company": [],
+            "policy": [],
+            "recruit": [],
+        }
+        for src in page.frames:
+            url = urldefrag(src)[0]
+            try:
+                parts = urlsplit(url)
+            except ValueError:
+                continue
+            key = (parts.path.rstrip("/") + "?" + parts.query).rstrip("?")
+            if (
+                parts.scheme in ("http", "https")
+                and site_host(url) == host
+                and key not in seen
+                and not _SKIP_EXT.search(parts.path)
+            ):
+                seen.add(key)
+                buckets["frame"].append((url, "frame"))
         for href, text in page.links:
             url = urldefrag(href)[0]
             try:
@@ -424,20 +648,29 @@ class Crawler:
             if key in seen or _SKIP_EXT.search(parts.path):
                 continue
             label = f"{unquote(parts.path)} {unquote(parts.query)} {text}"
-            for kind, pattern in (("contact", _CONTACT), ("recruit", _RECRUIT),
-                                  ("company", _COMPANY), ("policy", _POLICY)):
+            for kind, pattern in (
+                ("contact", _CONTACT),
+                ("recruit", _RECRUIT),
+                ("company", _COMPANY),
+                ("policy", _POLICY),
+            ):
                 if pattern.search(label):
                     seen.add(key)
                     buckets[kind].append((url, kind))
                     break
         # お断りの表示はお問い合わせページに書かれることが多いので、必ず先に読む
         # 4本目以降のお問い合わせページは、余裕があれば読む（読めなければ contact_unread の印が付く）
-        return (buckets["contact"][:3] + buckets["company"][:3] + buckets["policy"][:2]
-                + buckets["recruit"][:1] + buckets["contact"][3:])
+        return (
+            buckets["frame"][:3]
+            + buckets["contact"][:3]
+            + buckets["company"][:3]
+            + buckets["policy"][:2]
+            + buckets["recruit"][:1]
+            + buckets["contact"][3:]
+        )
 
 
-def save_result(conn: sqlite3.Connection, company_id: int, result: SiteResult,
-                confirmed: str = "") -> int:
+def save_result(conn: sqlite3.Connection, company_id: int, result: SiteResult, confirmed: str = "") -> int:
     """巡回の結果を保存する。新しく入った連絡先の数を返す。
 
     confirmed は、人が見て「営業お断りではない」と判断した検知文（改行区切り）。
@@ -468,14 +701,19 @@ def save_result(conn: sqlite3.Connection, company_id: int, result: SiteResult,
     if result.status in ("refused", "crawled", "no_email"):
         # サイトに載っていたアドレスを控える。お断りのサイトのアドレスは、別のサイトで見つかっても送らない
         conn.execute("DELETE FROM site_emails WHERE company_id=?", (company_id,))
-        conn.executemany("INSERT OR IGNORE INTO site_emails(company_id, email) VALUES (?,?)",
-                         [(company_id, email) for email in result.emails])
+        conn.executemany(
+            "INSERT OR IGNORE INTO site_emails(company_id, email) VALUES (?,?)",
+            [(company_id, email) for email in result.emails],
+        )
+    if result.status in ("crawled", "no_email"):
+        save_form(conn, company_id, result.form, ts)
     added = 0
     if result.status == "refused":
         for email in result.emails:
             conn.execute(
                 "UPDATE contacts SET status='rejected', decided_at=? "
-                "WHERE email=? AND status IN ('pending','approved')", (ts, email),
+                "WHERE email=? AND status IN ('pending','approved')",
+                (ts, email),
             )
     if result.status == "crawled":
         for email, (source_url, flags) in result.emails.items():
@@ -489,6 +727,52 @@ def save_result(conn: sqlite3.Connection, company_id: int, result: SiteResult,
             added += cur.rowcount
     conn.commit()
     return added
+
+
+DEMOTED = "自動で送れませんでした"  # 自動送信に失敗して、人が送ることにしたフォームの理由の書き出し
+
+
+def save_form(conn: sqlite3.Connection, company_id: int, plan: Plan | None, ts: str) -> None:
+    """見つけたフォームを控える。1社に1つ。
+
+    人が「送らない」と決めたもの、自動送信に失敗して人に回したもの、送信の記録があるものは、
+    今回の巡回でフォームが見つからなくても消さない（消すと、次の巡回で確認待ちに戻ってしまう）。
+    承認済みのフォームの作りが変わったら、確認待ちに戻す（承認したのは前の作りなので）。
+    """
+    row = conn.execute(
+        "SELECT id, signature, mode, reason, status, demoted, flags FROM forms WHERE company_id=?", (company_id,)
+    ).fetchone()
+    if plan is None:
+        if (
+            row is not None
+            and row["status"] == "pending"
+            and not row["demoted"]
+            and not conn.execute("SELECT 1 FROM form_sends WHERE form_id=? LIMIT 1", (row["id"],)).fetchone()
+        ):
+            conn.execute("DELETE FROM forms WHERE id=?", (row["id"],))
+        return
+    signature = plan.signature()
+    mode, reason = plan.mode, plan.reason
+    if row is None:
+        conn.execute(
+            "INSERT INTO forms(company_id, page_url, mode, kind, reason, flags, signature, plan, status, found_at) "
+            "VALUES (?,?,?,?,?,?,?,?, 'pending', ?)",
+            (company_id, plan.page_url, mode, plan.kind, reason, ",".join(plan.flags), signature, plan.to_json(), ts),
+        )
+        return
+    if row["demoted"] and mode == "auto":
+        # 一度失敗したフォームに、また自動で送らない
+        mode = "manual"
+        reason = row["reason"] if row["reason"].startswith(DEMOTED) else DEMOTED
+    status = row["status"]
+    # Approval covers the observed warnings as well as the form's field layout.
+    flags_changed = set(filter(None, row["flags"].split(","))) != set(plan.flags)
+    if status == "approved" and (row["signature"] != signature or row["mode"] != mode or flags_changed):
+        status = "pending"
+    conn.execute(
+        "UPDATE forms SET page_url=?, mode=?, kind=?, reason=?, flags=?, signature=?, plan=?, status=? WHERE id=?",
+        (plan.page_url, mode, plan.kind, reason, ",".join(plan.flags), signature, plan.to_json(), status, row["id"]),
+    )
 
 
 def crawl_pending(
@@ -508,11 +792,14 @@ def crawl_pending(
         try:
             result = crawler.crawl_site(row["site_url"])
         except Exception as e:  # 1社の不備で全体を止めない
-            result = SiteResult(host=site_host(row["site_url"]), status="error",
-                                note=f"{type(e).__name__}: {e}")
+            result = SiteResult(host=site_host(row["site_url"]), status="error", note=f"{type(e).__name__}: {e}")
         added = save_result(conn, row["id"], result, confirmed=row["refusal_confirmed"])
         counts[result.status] = counts.get(result.status, 0) + 1
         counts["_contacts"] = counts.get("_contacts", 0) + added
         tail = f" アドレス{added}件" if added else (f" {result.note}" if result.note else "")
+        if result.form is not None and result.status in ("crawled", "no_email"):
+            counts[f"_form_{result.form.mode}"] = counts.get(f"_form_{result.form.mode}", 0) + 1
+            label = {"auto": "自動で送れる", "manual": "人が送る", "skip": "送らない"}[result.form.mode]
+            tail += f" ／フォームあり（{label}{'：' + result.form.reason if result.form.reason else ''}）"
         log(f"[{result.status}] {row['name']} ({result.host}){tail}")
     return counts

@@ -1,4 +1,5 @@
 """HTML からメールアドレス・リンク・「営業お断り」の表示を取り出す。"""
+
 from __future__ import annotations
 
 import re
@@ -12,9 +13,21 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+\-]*@[A-Za-z0-9\-]+(?:\.[A-Za-z
 # 画像名（logo@2x.png など）や、明らかに店のものではないアドレスを捨てる
 _ASSET_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "css", "js", "ico", "woff", "woff2"}
 _JUNK_DOMAINS = {
-    "example.com", "example.co.jp", "example.jp", "example.org", "example.net",
-    "sentry.io", "wixpress.com", "sentry.wixpress.com", "domain.com", "email.com",
-    "xxx.com", "xxxx.com", "sample.com", "sample.co.jp", "yourdomain.com",
+    "example.com",
+    "example.co.jp",
+    "example.jp",
+    "example.org",
+    "example.net",
+    "sentry.io",
+    "wixpress.com",
+    "sentry.wixpress.com",
+    "domain.com",
+    "email.com",
+    "xxx.com",
+    "xxxx.com",
+    "sample.com",
+    "sample.co.jp",
+    "yourdomain.com",
 }
 _JUNK_LOCALS = {"noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon", "postmaster", "abuse"}
 
@@ -23,13 +36,46 @@ _RECRUIT_LOCALS = re.compile(r"(recruit|saiyo|saiyou|kyujin|job|jobs|entry|caree
 _PRIVACY_LOCALS = re.compile(r"(privacy|kojinjoho|dpo|security|legal)", re.I)
 
 FREE_MAIL_DOMAINS = {
-    "gmail.com", "yahoo.co.jp", "yahoo.com", "icloud.com", "me.com", "mac.com",
-    "outlook.com", "outlook.jp", "hotmail.com", "hotmail.co.jp", "live.jp", "live.com",
-    "docomo.ne.jp", "ezweb.ne.jp", "au.com", "softbank.ne.jp", "i.softbank.jp",
-    "ymobile.ne.jp", "rakuten.jp", "nifty.com", "ybb.ne.jp", "ocn.ne.jp", "aol.com",
-    "plala.or.jp", "biglobe.ne.jp", "so-net.ne.jp", "nifty.ne.jp", "dion.ne.jp",
-    "eonet.ne.jp", "kcn.ne.jp", "zaq.ne.jp", "bbtec.net", "infoweb.ne.jp", "mineo.jp",
-    "uqmobile.jp", "protonmail.com", "proton.me", "excite.co.jp", "mail.com", "gmx.com",
+    "gmail.com",
+    "yahoo.co.jp",
+    "yahoo.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "outlook.com",
+    "outlook.jp",
+    "hotmail.com",
+    "hotmail.co.jp",
+    "live.jp",
+    "live.com",
+    "docomo.ne.jp",
+    "ezweb.ne.jp",
+    "au.com",
+    "softbank.ne.jp",
+    "i.softbank.jp",
+    "ymobile.ne.jp",
+    "rakuten.jp",
+    "nifty.com",
+    "ybb.ne.jp",
+    "ocn.ne.jp",
+    "aol.com",
+    "plala.or.jp",
+    "biglobe.ne.jp",
+    "so-net.ne.jp",
+    "nifty.ne.jp",
+    "dion.ne.jp",
+    "eonet.ne.jp",
+    "kcn.ne.jp",
+    "zaq.ne.jp",
+    "bbtec.net",
+    "infoweb.ne.jp",
+    "mineo.jp",
+    "uqmobile.jp",
+    "protonmail.com",
+    "proton.me",
+    "excite.co.jp",
+    "mail.com",
+    "gmx.com",
 }
 
 # 「営業メールお断り」の類。話題の語と断りの表現が近くにあれば拒否表示とみなす。
@@ -44,12 +90,18 @@ _REFUSAL_VERB = (
     r"(?:対応|返信|返答|回答|返事|お答え|お応え)(?:は|を)?(?:(?:いた|致)?し(?:かね|ておりません|ていません|ません)|でき(?:ません|かね|ない))|"
     r"応じ(?:かね|られません|ません|ておりません)|"
     r"お受け(?:して(?:おり|い)ません|しかね|でき(?:ません|かねます)|(?:いた|致)し(?:かねます|ません|ておりません))|"
-    r"不要|(?<![A-Za-z])NG(?![A-Za-z])|差し控え|ご容赦|ご勘弁|おやめ|お止め)"
+    r"不要|(?<![A-Za-z])NG(?![A-Za-z])|差し控え|ご容赦|ご勘弁|おやめ|お止め|"
+    r"ではないこと(?:を|に)(?:確認|同意))"
 )
 # 文の途中の改行（<br> や見出しと本文の分かれ目）を1つまでまたぐ
 REFUSAL_RE = re.compile(
-    _REFUSAL_TOPIC + r"[^。\n]{0,40}?\n?[^。\n]{0,15}?" + _REFUSAL_VERB
-    + r"|" + _REFUSAL_VERB + r"[^。\n]{0,20}?\n?[^。\n]{0,10}?" + _REFUSAL_TOPIC
+    _REFUSAL_TOPIC
+    + r"[^。\n]{0,40}?\n?[^。\n]{0,15}?"
+    + _REFUSAL_VERB
+    + r"|"
+    + _REFUSAL_VERB
+    + r"[^。\n]{0,20}?\n?[^。\n]{0,10}?"
+    + _REFUSAL_TOPIC
 )
 
 # アドレスをわざと崩して書いている形（機械で拾われたくない意思表示なので、自動では拾わない）。
@@ -71,7 +123,26 @@ _GLUED_DIGITS_RE = re.compile(r"^[0-9\-]{9,}(?=[a-z])")
 _JOIN = "\x00"  # タグをまたいでつないだ位置の目印
 
 _SKIP_TAGS = {"script", "style", "noscript", "template", "svg"}
-_BLOCK_TAGS = {"br", "p", "div", "li", "tr", "td", "th", "h1", "h2", "h3", "h4", "h5", "dt", "dd", "section", "ul", "ol", "table"}
+_BLOCK_TAGS = {
+    "br",
+    "p",
+    "div",
+    "li",
+    "tr",
+    "td",
+    "th",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "dt",
+    "dd",
+    "section",
+    "ul",
+    "ol",
+    "table",
+}
 
 
 @dataclass
@@ -83,6 +154,8 @@ class Page:
     title: str = ""
     obfuscated: bool = False  # アドレスを崩して書いているページ
     text_split: str = ""  # タグの境目をすべて区切った本文（タグをまたいだアドレスの見分け用）
+    frames: list[str] = field(default_factory=list)  # <frame> の中身のURL
+    hints: str = ""  # 入力欄の薄い文字や説明（「営業お断り」の判定にだけ使う）
 
 
 class _Parser(HTMLParser):
@@ -92,6 +165,8 @@ class _Parser(HTMLParser):
         self.chunks: list[str] = []
         self.links: list[tuple[str, str]] = []
         self.mailtos: list[str] = []
+        self.frames: list[str] = []
+        self.hints: list[str] = []
         self.title_parts: list[str] = []
         self._skip_depth = 0
         self._in_title = False
@@ -111,6 +186,12 @@ class _Parser(HTMLParser):
                 self.base_url = urljoin(self.base_url, attr["href"])
             except ValueError:
                 pass
+        if tag == "frame" and attr.get("src", "").strip():
+            # フレームで組まれた古いサイトは、中身が別のページにある
+            try:
+                self.frames.append(urljoin(self.base_url, attr["src"].strip()))
+            except ValueError:
+                pass
         if tag in ("a", "area"):
             href = attr.get("href", "").strip()
             if href.lower().startswith("mailto:"):
@@ -121,6 +202,15 @@ class _Parser(HTMLParser):
                     self._link_text = [attr.get("title", ""), attr.get("aria-label", "")]
                 except ValueError:
                     self._link_href = None  # 壊れた href。そのリンクだけ捨てる
+        if tag in ("input", "textarea", "button") and attr.get("type", "").lower() != "hidden" and not self._skip_depth:
+            # 入力欄の薄い文字や説明も本文として読む（「営業のご連絡はお断り」が欄の中に書かれていることがある）
+            # アドレスの見本（例: taro@…）が書かれることも多いので、アドレス集めには使わない
+            for key in ("placeholder", "title", "aria-label"):
+                if attr.get(key):
+                    self.hints.append(attr[key])
+            # Input button captions are visible text, but never a source of contact addresses.
+            if tag == "input" and attr.get("type", "").lower() in ("submit", "button", "reset") and attr.get("value"):
+                self.hints.append(attr["value"])
         if tag == "img" and attr.get("alt"):
             # 画像の代替文字も本文として読む（「営業メールお断り」が画像のことがある）
             if self._link_href is not None:
@@ -182,15 +272,15 @@ def parse_html(html: str, url: str) -> Page:
         return re.sub(r" ?\n[ \n]*", "\n", value).strip()
 
     text = tidy(raw_text)
-    obfuscated = bool(
-        _CHARREF_AT_RE.search(html) or _ZENKAKU_NOTE_RE.search(raw_text) or OBFUSCATED_RE.search(text)
-    )
+    obfuscated = bool(_CHARREF_AT_RE.search(html) or _ZENKAKU_NOTE_RE.search(raw_text) or OBFUSCATED_RE.search(text))
     return Page(
         url=url,
         text=text,
         text_split=tidy(marked.replace(_JOIN, " ")),
         links=parser.links,
         mailtos=parser.mailtos,
+        frames=parser.frames,
+        hints=tidy("\n".join(parser.hints)),
         title=" ".join("".join(parser.title_parts).split()),
         obfuscated=obfuscated,
     )
@@ -221,7 +311,7 @@ def extract_contacts(page: Page) -> list[tuple[str, list[str]]]:
         return []
     found: dict[str, list[str]] = {}
     for href in page.mailtos:
-        target = unquote(href[len("mailto:"):].split("?", 1)[0])
+        target = unquote(href[len("mailto:") :].split("?", 1)[0])
         for part in target.split(","):
             email = _clean_email(part)
             if email:
@@ -241,14 +331,14 @@ def extract_contacts(page: Page) -> list[tuple[str, list[str]]]:
         digits = _GLUED_DIGITS_RE.match(local)
         if digits:
             # 「TEL:0742-12-3456info@…」のように、電話番号がくっついた形
-            email = _clean_email(local[digits.end():] + "@" + domain) or email
+            email = _clean_email(local[digits.end() :] + "@" + domain) or email
             flags.append("label_glued")
         elif label:
             flags.append("label_glued")
             if written[: label.end()] != written[: label.end()].lower():
                 # 「MAIL.info@…」のように見出しが大文字なら、見出しを落とす。
                 # 全部小文字（mail.info@…）は本当のアドレスかもしれないので、書かれたとおりに残す
-                email = _clean_email(local[label.end():] + "@" + domain) or email
+                email = _clean_email(local[label.end() :] + "@" + domain) or email
         if email not in found:
             found[email] = flags
     return list(found.items())
@@ -261,12 +351,13 @@ def extract_emails(page: Page) -> list[str]:
 def find_refusals(page: Page) -> list[str]:
     """「営業メールお断り」の類が書かれていれば、その前後の文をすべて返す。"""
     out: list[str] = []
-    for m in REFUSAL_RE.finditer(page.text):
-        start = max(0, m.start() - 30)
-        end = min(len(page.text), m.end() + 30)
-        snippet = " ".join(page.text[start:end].split())
-        if snippet not in out:
-            out.append(snippet)
+    for source in (page.text, page.hints):
+        for m in REFUSAL_RE.finditer(source):
+            start = max(0, m.start() - 30)
+            end = min(len(source), m.end() + 30)
+            snippet = " ".join(source[start:end].split())
+            if snippet not in out:
+                out.append(snippet)
     return out
 
 
