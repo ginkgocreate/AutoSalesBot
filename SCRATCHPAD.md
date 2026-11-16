@@ -29,7 +29,7 @@
 - [x] 同じ公開メールを共有する会社について、メール・自動フォーム・手動フォーム間の重複を防止。
 - [x] Python 3.9 / 3.14 の全テスト、lint、formatを通過。
 - [x] commit・push・PR作成完了: https://github.com/ginkgocreate/AutoSalesBot/pull/1
-- [ ] 最新コミットのCI結果を確認。
+- [x] 実装コミット `820b253` のCIを確認。push / PR のPython 3.9・3.14・qualityがすべて成功。
 
 ## 検証証跡
 
@@ -41,6 +41,7 @@
 - Ruff 0.17.5: `ruff check --config ruff.toml autosales tests` 成功、`ruff format --config ruff.toml --check autosales tests` 26ファイル成功。
 - `compileall` / `git diff --check` 成功。Ruff設定とPython 3.9 / 3.14のGitHub Actionsを追加。
 - 初回CIはPython 3.14とquality成功。Python 3.9はubuntu-latest（26.04）の配布バイナリ不足で準備段階に失敗。公式versions-manifestで3.9/3.14対応を確認し、テストrunnerをUbuntu 22.04に固定。
+- 修正後CI: https://github.com/ginkgocreate/AutoSalesBot/actions/runs/43840681664 （PR）と https://github.com/ginkgocreate/AutoSalesBot/actions/runs/43840671865 （push）で全3ジョブ成功。
 
 ## Stocked Issues
 
