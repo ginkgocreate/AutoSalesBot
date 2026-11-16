@@ -249,12 +249,39 @@ python3 -m autosales stats
 
 ```bash
 python3 -m unittest discover -s tests
-uvx ruff==0.17.5 check --config ruff.toml autosales tests
-uvx ruff==0.17.5 format --config ruff.toml --check autosales tests
+uvx ruff==0.17.5 check --config ruff.toml autosales scripts tests
+uvx ruff==0.17.5 format --config ruff.toml --check autosales scripts tests
 ```
 
 外にはつながず、手元に立てた仮の Web サーバーとメールサーバーで、取り込みから返信の処理までを通しで確かめます。
 フォームの自動送信は、仮のサーバーでしか試していません。実際のサイトへは、1件ずつ結果を見ながら始めてください。
+
+### ワークフローのドライテスト
+
+架空の4社を使い、CSV取り込み → 公式ページの巡回 → メール・通常フォーム・CAPTCHA・営業拒否の分類 →
+確認CSVの出力と承認取り込み → メールとフォームの下書き作成までを、実際のCLI処理で再現します。
+
+```bash
+python3 scripts/dry_run_smoke.py --output-dir /tmp/analink-dry-run-evidence
+```
+
+既定は下書きまでです。メール・フォーム各1件の下書きを作り、SMTP接続・フォームPOST・本送信記録がすべて0件であること、
+件名と本文に差し込み残りがないことを検証します。`.env` や運用DBは読みません。一時DBとlocalhost上の架空サイトを使い、
+DNS・ソケット接続はこのテストが立てたサーバー以外を拒否します。保存先はリポジトリの外を指定してください。
+
+送信処理と返信処理も確認したい場合は、次を使います。
+
+```bash
+python3 scripts/dry_run_smoke.py --output-dir /tmp/analink-dry-run-evidence --local-delivery
+```
+
+同じドライテストに続けて、別の段階でlocalhostの仮SMTPと仮フォームへ各1件を送ります。
+再実行時の重複0件、番号返信1件、停止1件、CAPTCHAの手動待ち1件も確認します。
+この段階で使う `--live` は仮サーバーに限られ、外部宛先には届きません。返信は架空メールを処理関数へ直接渡すため、IMAPには接続しません。
+
+実行ごとに表示される `run-*` ディレクトリへ、`result.json`（件数と検証結果）、`transcript.log`（CLI実行記録）、
+確認用CSV、下書き、`dry-run.sqlite3` を保存します。追加段階を実行した場合は `local-delivery.sqlite3` も保存します。
+検索APIによる外部候補収集、実SMTP・IMAP、実サイトへの送信、ブラウザーによる手動送信は、このテストの対象外です。
 
 ## DBの更新
 
