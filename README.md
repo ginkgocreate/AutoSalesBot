@@ -24,6 +24,30 @@ python3 -m autosales init
 `.env` ができるので、送信者の情報（会社名・担当者・住所・メール）と SMTP の設定を書きます。
 送信者の情報が空のままだと送信できません。
 
+### 運用前の設定確認
+
+```bash
+python3 -m autosales doctor
+python3 -m autosales doctor --json
+python3 -m autosales doctor --require draft
+```
+
+送信者・ひな形・SMTP・IMAPを、リサーチ／下書き／メール送信設定／返信受信設定の段階ごとに確認します。
+設定値や認証情報は出力せず、ネット接続・DB作成・DB移行も行いません。診断だけなら終了コード0、
+`--require research|draft|email|replies` を付けると、その段階が未準備の場合は終了コード1です。
+独自のひな形は `--template 名前` で指定でき、複数指定もできます。
+
+`sender@example.invalid` などのダミー送信元は下書き用として許容し、実配信設定は未準備にします。
+`email_ready` や `replies_ready` は設定形式の確認結果であり、ログイン・到達・返信処理の成功を意味しません。
+外部SMTPの `none` は準備済みと判定せず、`ssl` または `starttls` を必要とします。
+
+送信元情報の到着前は、隔離した `ASB_HOME` にダミーの会社名・担当者・住所と
+`sender@example.invalid` を設定して下書きを確認できます。SMTP・IMAPは空欄のままにします。
+実情報へ置き換えた後は同じ `ASB_HOME` で `doctor --require email` と
+`doctor --require replies` を実行し、送信元から下書きを再生成してください。
+診断は送信コマンドの代行や接続テストではありません。実際の到達・返信処理は、
+確認用の宛先で別途検証してから営業対象の承認へ進みます。
+
 ### 1. 候補を集める
 
 ```bash
@@ -48,6 +72,21 @@ python3 -m autosales import seeds.csv
 
 どの入れ方でも、ポータルサイトや SNS の URL は入りません。**入れるのは、その会社・店の公式サイトだけ**です。
 `--segment`（層）は送り分けと集計に使います（例: `honbu` = 複数店舗の運営会社、`show` = ショーを毎日やる店）。
+
+Claudeが利用上限・ログイン切れ・CLI不在・無出力の時間切れになった場合に、地図検索へ切り替えることもできます。
+地域と種類の両方を明示します。
+
+```bash
+python3 -m autosales discover search "大阪でラウンジを複数店舗運営している会社" \
+  --segment honbu --limit 3 \
+  --fallback-osm-area 大阪市 --fallback-osm-kinds nightclub,music_venue \
+  --fallback-segment show
+```
+
+代替経路で得られるのは地図登録の店舗候補です。元の会社検索と同条件ではないため、業態・運営会社を確認してください。
+元の `honbu` 区分は引き継がず、代替用の層を省略した場合は空欄で登録します。取得上限は代替経路にも適用します。
+検索結果0件、不正JSON、途中結果を含む失敗、CLI引数の誤りでは切り替えません。
+地図APIが利用できなければ理由を表示して終了し、成功したようには扱いません。
 
 ### 2. アドレスを集めて、確認する
 
